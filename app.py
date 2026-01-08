@@ -67,58 +67,43 @@ def parse_full_medicine_pdf(file):
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
-            # 1. 動態判定類別
+            # 1. 動態判定類別 (根據頁面標題)
             if "(1)" in text or "カテゴリA" in text: cat = "Cat A (最優先)"
             elif "(2)" in text or "カテゴリB" in text: cat = "Cat B (優先)"
             elif "(3)" in text or "カテゴリC" in text: cat = "Cat C (穩定確保)"
 
-            # 2. 方法 A：抓取表格
-            ts = page.extract_tables()
-            for t in ts:
-                for r in t:
-                    if r and len(r) >= 3:
-                        # 只要第一欄包含「内、注、外」就處理
-                        route_raw = str(r[0])
-                        if any(x in route_raw for x in ['内', '注', '外']):
-                            clean_route = "".join(sorted(list(set(re.findall(r'内|注|外', route_raw)))))
-                            code = str(r[1]).strip().split('\n')[0]
-                            name = str(r[2]).strip().replace('\n', '')
-                            
-                            if name and name != "成分名" and len(name) > 1:
-                                if not any(d['成分日文名'] == name for d in all_data):
-                                    all_data.append({
-                                        "類別": cat, "給藥方式": clean_route,
-                                        "用途類別": code, "成分日文名": name
-                                    })
-
-            # 3. 方法 B：強化版文字行掃描 (專門對付第11-16頁)
+            # --- 核心邏輯：模糊模式掃描 ---
+            # 匹配規律：行首或字串中出現 (内|注|外)，後跟 3 位數字，後跟一段日文字元
+            # 這個正則表達式會捕獲所有「長得像藥品列」的文字，不管它是不是在表格裡
+            pattern = re.compile(r'(内|注|外)\s*(\d{3})\s*([^\s\d\t]+)')
+            
+            # 我們將整頁文字按行處理，並進行深度清洗
             lines = text.split('\n')
             for l in lines:
                 l = l.strip()
-                # 模糊匹配：行首為 (内|注|外)，後面接著 3 位數字，後面是成分名
-                # \s* 代表可能有 0 個或多個空格，對付排版不齊的問題
-                m = re.match(r'^(内|注|外)\s*(\d{3})\s*(.+)$', l)
-                if m:
-                    route, code, name = m.groups()
-                    name = name.strip()
-                    if not any(d['成分日文名'] == name for d in all_data):
-                        all_data.append({
-                            "類別": cat, "給藥方式": route,
-                            "用途類別": code, "成分日文名": name
-                        })
+                # 排除標題列
+                if "成分名" in l or "薬效分類" in l: continue
                 
-                # 額外補丁：有些行可能因為編碼問題，空格被吃掉
-                # 匹配格式如 "注613ゲンタマイシン"
-                elif re.match(r'^(内|注|外)(\d{3})(.+)$', l):
-                    m2 = re.match(r'^(内|注|外)(\d{3})(.+)$', l)
-                    route, code, name = m2.groups()
+                # 執行匹配
+                matches = pattern.findall(l)
+                for m in matches:
+                    route, code, name = m
                     name = name.strip()
+                    
+                    # 過濾掉太短或無意義的字元
+                    if len(name) < 2: continue
+                    
+                    # 檢查重複 (非常重要，因為這會抓到表格內的文字)
                     if not any(d['成分日文名'] == name for d in all_data):
                         all_data.append({
-                            "類別": cat, "給藥方式": route,
-                            "用途類別": code, "成分日文名": name
+                            "類別": cat,
+                            "給藥方式": route,
+                            "用途類別": code,
+                            "成分日文名": name
                         })
-                        
+
+    # 最終校對：如果抓到的數量還是不對，可能是因為有些成分名中間帶有空格
+    # 我們可以增加一組更寬鬆的匹配邏輯
     return pd.DataFrame(all_data)
 # --- 4. Streamlit UI 介面 ---
 st.set_page_config(layout="wide", page_title="安定確保醫藥品 506項解析")
