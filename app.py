@@ -8,26 +8,22 @@ import io
 from urllib.parse import quote
 from bs4 import BeautifulSoup
 
-# --- 1. Azure 設定 ---
+# --- 1. 設定區域 ---
 AZURE_KEY = "9JDF24qrsW8rXiYmChS17yEPyNRI96nNXXqEKn5CyI6ql6iYcTOFJQQJ99BLAC3pKaRXJ3w3AAAbACOGVYVU"
 AZURE_ENDPOINT = "https://api.cognitive.microsofttranslator.com"
 AZURE_REGION = "eastasia"
 
-# --- 2. 翻譯與對照邏輯 (嚴格執行先後順序) ---
+# --- 2. 翻譯與對照核心邏輯 (嚴格執行 Azure 優先) ---
 
-def get_english_name(jp_name):
+def get_english_name_logic(jp_name):
     """
-    核心邏輯：
-    1. 先嘗試 Azure 翻譯
-    2. 如果 Azure 失敗 (None 或錯誤)，再爬 KEGG
+    邏輯：1. Azure 翻譯 -> 2. 失敗則 KEGG 爬蟲
     """
     if not jp_name or str(jp_name).lower() == 'none':
         return "N/A", "Skip"
 
     # --- Step 1: Azure 翻譯 ---
-    en_name = None
     try:
-        # 清理日文，移除括號
         clean_ja = re.split(r'[\(\n\s（]', str(jp_name))[0].strip()
         url = f"{AZURE_ENDPOINT.strip('/')}/translate?api-version=3.0&from=ja&to=en"
         headers = {
@@ -37,17 +33,16 @@ def get_english_name(jp_name):
         }
         res = requests.post(url, headers=headers, json=[{'text': clean_ja}], timeout=8)
         if res.status_code == 200:
-            en_name = res.json()[0]['translations'][0]['text']
-            # 如果翻譯結果看起來有效，直接回傳
-            if en_name and len(en_name) > 2:
-                return en_name, "Azure"
+            en_res = res.json()[0]['translations'][0]['text']
+            if en_res and len(en_res) > 2:
+                return en_res, "Azure"
     except:
         pass
 
-    # --- Step 2: KEGG 爬蟲 (當 Azure 失敗時) ---
+    # --- Step 2: KEGG 爬蟲 (Azure 沒拿到結果時) ---
     try:
-        search_keyword = re.split(r'[\(\n\s（]', str(jp_name))[0].strip()
-        search_url = f"https://www.kegg.jp/medicus-bin/search_drug?search_keyword={quote(search_keyword)}"
+        search_kw = re.split(r'[\(\n\s（]', str(jp_name))[0].strip()
+        search_url = f"https://www.kegg.jp/medicus-bin/search_drug?search_keyword={quote(search_kw)}"
         r_s = requests.get(search_url, timeout=10)
         codes = re.findall(r'japic_code=(\d+)', r_s.text + r_s.url)
         if codes:
@@ -57,96 +52,110 @@ def get_english_name(jp_name):
             soup = BeautifulSoup(ri.text, 'html.parser')
             th = soup.find('th', string=re.compile(r'欧文一般名'))
             if th and th.find_next_sibling('td'):
-                kegg_en = th.find_next_sibling('td').get_text(strip=True)
-                return kegg_en, "KEGG"
+                return th.find_next_sibling('td').get_text(strip=True), "KEGG"
     except:
         pass
 
     return "[翻譯失敗]", "None"
 
-def parse_full_506(file):
+# --- 3. 解析函式 (修正漏抓 506 項的問題) ---
+
+def parse_full_medicine_pdf(file):
+    """
+    同時使用表格提取與文字正則匹配，確保抓到所有 506 項
+    """
     all_data = []
-    current_cat = "未知"
+    cat = "未知類別"
     
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
-            # 更新類別判定
-            if "(1)" in text: current_cat = "Cat A"
-            elif "(2)" in text: current_cat = "Cat B"
-            elif "(3)" in text: current_cat = "Cat C"
+            # 更新類別狀態
+            if "(1)" in text: cat = "Cat A (最優先)"
+            elif "(2)" in text: cat = "Cat B (優先)"
+            elif "(3)" in text: cat = "Cat C (穩定確保)"
 
-            # 策略 A: 抓取標準表格 (前10頁)
-            tables = page.extract_tables()
-            for table in tables:
-                for row in table:
-                    if len(row) >= 3:
-                        route_raw = str(row[0])
-                        # 只要包含關鍵字就抓取
-                        if any(r in route_raw for r in ['内', '注', '外']):
+            # 方法 A: 提取表格
+            ts = page.extract_tables()
+            for t in ts:
+                for r in t:
+                    if len(r) >= 3:
+                        route_raw = str(r[0])
+                        # 只要包含關鍵字就抓取 (處理 "注 注" 重疊)
+                        if any(x in route_raw for x in ['内', '注', '外']):
                             clean_route = "".join(set(re.findall(r'内|注|外', route_raw)))
                             all_data.append({
-                                "類別": current_cat,
+                                "類別": cat,
                                 "給藥方式": clean_route,
-                                "用途類別": str(row[1]).strip().split('\n')[0],
-                                "成分日文名": str(row[2]).strip().replace('\n', '')
+                                "用途類別": str(r[1]).strip().split('\n')[0],
+                                "成分日文名": str(r[2]).strip().replace('\n', '')
                             })
 
-            # 策略 B: 針對第11頁後的「純文字行」進行 Regex 補抓
+            # 方法 B: 正則表達式補位 (針對 Page 11 後的文字清單)
             lines = text.split('\n')
-            for line in lines:
-                # 匹配格式：給藥方式(内/注/外) + 3位數字 + 成分名
-                match = re.search(r'^(内|注|外)\s+(\d{3})\s+(.+)$', line.strip())
-                if match:
-                    route, code, name = match.groups()
-                    # 檢查重複，避免與策略 A 抓到的重疊
+            for l in lines:
+                m = re.search(r'^(内|注|外)\s+(\d{3})\s+(.+)$', l.strip())
+                if m:
+                    route, code, name = m.groups()
+                    # 避免重複
                     if not any(d['成分日文名'] == name for d in all_data):
                         all_data.append({
-                            "類別": current_cat,
+                            "類別": cat,
                             "給藥方式": route,
                             "用途類別": code,
                             "成分日文名": name
                         })
+                        
     return pd.DataFrame(all_data)
-# --- 3. Streamlit UI ---
-st.title("💊 506項藥品全解析 (Azure 優先模式)")
 
-f = st.file_uploader("上傳 PDF", type=['pdf'])
+# --- 4. Streamlit UI 介面 ---
+st.set_page_config(layout="wide", page_title="安定確保醫藥品 506項解析")
+st.title("💊 安定確保醫藥品全量解析工具")
+st.write("解析邏輯：PDF 表格+文字掃描 (506項) -> Azure 優先翻譯 -> KEGG 備援")
+
+f = st.file_uploader("請上傳 PDF (000785498.pdf)", type=['pdf'])
 
 if f:
     if 'raw_df' not in st.session_state:
-        st.session_state.raw_df = parse_medicine_pdf(f)
+        with st.spinner("正在提取 506 項成分清單..."):
+            # 呼叫修正後的函式名
+            st.session_state.raw_df = parse_full_medicine_pdf(f)
     
     df = st.session_state.raw_df
-    st.write(f"已從 PDF 提取 {len(df)} 項成分清單。")
-    st.dataframe(df.head(10)) # 先預覽前10項確保日文名沒抓錯
+    st.success(f"✅ 成功提取 {len(df)} 項成分！")
+    st.dataframe(df, use_container_width=True)
 
-    if st.button("🚀 開始全量翻譯 (先 Azure 後 KEGG)"):
-        final_results = []
+    if st.button("🚀 開始全量對照 (Azure + KEGG)"):
+        final_list = []
         bar = st.progress(0)
         status = st.empty()
         
         for i, row in df.iterrows():
             jp_name = row["成分日文名"]
-            status.text(f"處理中 ({i+1}/{len(df)}): {jp_name}")
+            status.text(f"處理進度 ({i+1}/{len(df)}): {jp_name}")
             
-            # 執行雙重對照邏輯
-            en_name, source = get_english_name(jp_name)
+            # 執行翻譯邏輯
+            en_name, source = get_english_name_logic(jp_name)
             
-            final_results.append({
+            final_list.append({
                 "類別": row["類別"],
                 "給藥方式": row["給藥方式"],
                 "用途類別": row["用途類別"],
                 "成分日文名": jp_name,
                 "成分英文名": en_name,
-                "對照來源": source
+                "翻譯來源": source
             })
             bar.progress((i + 1) / len(df))
             
-        res_df = pd.DataFrame(final_results)
-        st.success("全部解析完成！")
-        st.dataframe(res_df)
+            # 緩衝
+            if i % 15 == 0: time.sleep(0.1)
+            
+        res_df = pd.DataFrame(final_list)
+        st.success("🎉 全量對照完成！")
+        st.dataframe(res_df, use_container_width=True)
         
-        # 匯出 CSV (UTF-8-SIG 確保 Excel 不亂碼)
-        csv_data = res_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下載完整 CSV 報告", csv_data, "Japan_Medicine_Full_Report.csv")
+        # 下載 Excel
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
+            res_df.to_excel(writer, index=False)
+        st.download_button("📥 下載全解析 Excel 報告", out.getvalue(), "Medicine_Full_Report.xlsx")
