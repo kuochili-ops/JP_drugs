@@ -61,43 +61,48 @@ def get_english_name_logic(jp_name):
 # --- 3. 解析函式 (修正漏抓 506 項的問題) ---
 
 def parse_full_medicine_pdf(file):
-    """
-    同時使用表格提取與文字正則匹配，確保抓到所有 506 項
-    """
     all_data = []
     cat = "未知類別"
     
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
-            # 更新類別狀態
-            if "(1)" in text: cat = "Cat A (最優先)"
-            elif "(2)" in text: cat = "Cat B (優先)"
-            elif "(3)" in text: cat = "Cat C (穩定確保)"
+            # 1. 動態判定類別 (根據頁面文字)
+            if "(1)" in text or "カテゴリA" in text: cat = "Cat A (最優先)"
+            elif "(2)" in text or "カテゴリB" in text: cat = "Cat B (優先)"
+            elif "(3)" in text or "カテゴリC" in text: cat = "Cat C (穩定確保)"
 
-            # 方法 A: 提取表格
+            # 2. 方法 A：抓取表格 (針對有框線的頁面)
             ts = page.extract_tables()
             for t in ts:
                 for r in t:
-                    if len(r) >= 3:
+                    if r and len(r) >= 3:
                         route_raw = str(r[0])
-                        # 只要包含關鍵字就抓取 (處理 "注 注" 重疊)
+                        # 只要包含「内、注、外」關鍵字就視為有效列
                         if any(x in route_raw for x in ['内', '注', '外']):
-                            clean_route = "".join(set(re.findall(r'内|注|外', route_raw)))
-                            all_data.append({
-                                "類別": cat,
-                                "給藥方式": clean_route,
-                                "用途類別": str(r[1]).strip().split('\n')[0],
-                                "成分日文名": str(r[2]).strip().replace('\n', '')
-                            })
+                            # 清理重複字體 (如：注 注 -> 注)
+                            clean_route = "".join(sorted(list(set(re.findall(r'内|注|外', route_raw)))))
+                            # 提取編號與成分名
+                            code = str(r[1]).strip().split('\n')[0]
+                            name = str(r[2]).strip().replace('\n', '')
+                            
+                            if name and name != "成分名": # 避開標題列
+                                all_data.append({
+                                    "類別": cat,
+                                    "給藥方式": clean_route,
+                                    "用途類別": code,
+                                    "成分日文名": name
+                                })
 
-            # 方法 B: 正則表達式補位 (針對 Page 11 後的文字清單)
+            # 3. 方法 B：正則表達式掃描 (針對第 11 頁後的純文字清單)
+            # 匹配格式範例: "注 613 ゲンタマイシン硫酸塩"
             lines = text.split('\n')
             for l in lines:
+                # 關鍵正則：(給藥方式) + (空格) + (3位數字類別) + (空格) + (成分名)
                 m = re.search(r'^(内|注|外)\s+(\d{3})\s+(.+)$', l.strip())
                 if m:
                     route, code, name = m.groups()
-                    # 避免重複
+                    # 檢查是否已在表格中抓過，避免重複
                     if not any(d['成分日文名'] == name for d in all_data):
                         all_data.append({
                             "類別": cat,
@@ -107,7 +112,6 @@ def parse_full_medicine_pdf(file):
                         })
                         
     return pd.DataFrame(all_data)
-
 # --- 4. Streamlit UI 介面 ---
 st.set_page_config(layout="wide", page_title="安定確保醫藥品 506項解析")
 st.title("💊 安定確保醫藥品全量解析工具")
