@@ -4,80 +4,70 @@ import requests
 import re
 from urllib.parse import quote
 
-# 核心：片假名轉英文拼音基礎表 (解決大部分轉換問題)
-KATA_TO_EN = {
-    'ア': 'a', 'イ': 'i', 'ウ': 'u', 'エ': 'e', 'オ': 'o',
-    'カ': 'ka', 'キ': 'ki', 'ク': 'ku', 'ケ': 'ke', 'コ': 'ko',
-    'サ': 'sa', 'シ': 'shi', 'ス': 'su', 'セ': 'se', 'ソ': 'so',
-    'タ': 'ta', 'チ': 'chi', 'ツ': 'tsu', 'テ': 'te', 'ト': 'to',
-    'ナ': 'na', 'ニ': 'ni', 'ヌ': 'nu', 'ネ': 'ne', 'ノ': 'no',
-    'ハ': 'ha', 'ヒ': 'hi', 'フ': 'fu', 'ヘ': 'he', 'ホ': 'ho',
-    'マ': 'ma', 'ミ': 'mi', 'ム': 'mu', 'メ': 'me', 'モ': 'mo',
-    'ヤ': 'ya', 'ユ': 'yu', 'ヨ': 'yo',
-    'ラ': 'ra', 'リ': 'ri', 'ル': 'ru', 'レ': 're', 'ロ': 'ro',
-    'ワ': 'wa', 'ン': 'n', 'ガ': 'ga', 'ギ': 'gi', 'グ': 'gu', 'ゲ': 'ge', 'ゴ': 'go',
-    'ザ': 'za', 'ジ': 'ji', 'ズ': 'zu', 'ゼ': 'ze', 'ゾ': 'zo',
-    'ダ': 'da', 'ヂ': 'ji', 'ヅ': 'zu', 'デ': 'de', 'ド': 'do',
-    'バ': 'ba', 'ビ': 'bi', 'ブ': 'bu', 'ベ': 'be', 'ボ': 'bo',
-    'パ': 'pa', 'ピ': 'pi', 'プ': 'pu', 'ペ': 'pe', 'ポ': 'po',
-    'ャ': 'ya', 'ュ': 'yu', 'ョ': 'yo', 'ッ': '', 'ー': ''
-}
+def fetch_kegg_english(japanese_name):
+    """
+    直接請求日本 KEGG 權威數據庫進行對照
+    """
+    if not japanese_name or pd.isna(japanese_name):
+        return "N/A"
 
-# 鹽類與後綴對應
-SUFFIX_CLEAN = {
-    "塩酸塩": " hydrochloride", "硫酸塩": " sulfate", "カリウム": " potassium",
-    "ナトリウム": " sodium", "水和物": " hydrate", "フマル酸塩": " fumarate"
-}
-
-def auto_translate(text):
-    """ 引擎1：邏輯翻譯 (不依賴詞庫) """
-    if not text: return ""
-    # 移除括號雜訊
-    text = re.sub(r'[\(\（].*?[\)\）]', '', str(text)).strip()
+    # 清除日文括號備註 (如品牌名)
+    clean_ja = re.sub(r'[\(\（].*?[\)\）]', '', str(japanese_name)).strip()
     
-    # 處理鹽類後綴分離
-    suffix_en = ""
-    for ja, en in SUFFIX_CLEAN.items():
-        if ja in text:
-            suffix_en = en
-            text = text.replace(ja, "")
-            break
-            
-    # 執行音譯轉換
-    res = "".join([KATA_TO_EN.get(char, char) for char in text])
-    return res.capitalize() + suffix_en
+    # 對於複合藥，拆分後分別請求
+    if '･' in clean_ja or '・' in clean_ja:
+        parts = re.split(r'[･・]', clean_ja)
+        return " / ".join([fetch_kegg_english(p) for p in parts])
 
-def get_pubchem_standard(eng_name):
-    """ 引擎2：外部資源校正 (向 PubChem 驗證) """
     try:
-        url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{quote(eng_name)}/synonyms/JSON"
-        resp = requests.get(url, timeout=3)
-        if resp.status_code == 200:
-            return resp.json()['InformationList']['Information'][0]['Synonym'][0]
-    except:
-        pass
-    return eng_name # 查不到就用翻譯好的
+        # 外部資源：KEGG API (日本最權威藥物數據庫)
+        # 步驟 1: 搜尋藥物日文名對應的 KEGG 藥物編號 (D編號)
+        search_url = f"https://rest.kegg.jp/find/drug/{quote(clean_ja)}"
+        response = requests.get(search_url, timeout=5)
+        
+        if response.status_code == 200 and response.text.strip():
+            # 獲取第一個匹配的 D 編號
+            kegg_id = response.text.split('\t')[0].replace('dr:', '')
+            
+            # 步驟 2: 獲取該編號的詳細資訊 (包含英文名)
+            info_url = f"https://rest.kegg.jp/get/{kegg_id}"
+            info_resp = requests.get(info_url, timeout=5)
+            
+            if info_resp.status_code == 200:
+                # 在回傳文本中尋找 "NAME" 欄位下的英文部分
+                lines = info_resp.text.split('\n')
+                for line in lines:
+                    if line.startswith('NAME'):
+                        # 格式通常是: NAME  Japanese (English)
+                        match = re.search(r'\((.*?)\)', line)
+                        if match:
+                            return match.group(1).split(';')[0].strip()
+        
+        # 備援機制：如果 KEGG 沒抓到，標記為需核對
+        return f"[未查獲] {clean_ja}"
 
-def process_line(ja_name):
-    # 處理複合劑
-    if '･' in ja_name or '・' in ja_name:
-        parts = re.split(r'[･・]', ja_name)
-        return " / ".join([get_pubchem_standard(auto_translate(p)) for p in parts])
-    return get_pubchem_standard(auto_translate(ja_name))
+    except Exception:
+        return f"[連線超時] {clean_ja}"
 
 # --- UI ---
-st.title("🌐 外部資源 + 邏輯翻譯器 (505項全自動版)")
-st.write("此版本優先使用邏輯音譯，再由外部數據庫 PubChem 進行名稱校正。")
+st.set_page_config(layout="wide")
+st.title("🛡️ KEGG 日本官方數據庫：505項全量對照")
+st.markdown("此版本直接串接 **KEGG (Kyoto Encyclopedia of Genes and Genomes)**，是目前識別日文藥名最精準的外部資源。")
 
-f = st.file_uploader("上傳最後一份 CSV", type=['csv'])
+f = st.file_uploader("上傳 CSV 檔案", type=['csv'])
 
 if f:
     df = pd.read_csv(f)
-    if st.button("🚀 啟動 505 項掃描 (不需詞庫)"):
-        with st.spinner('引擎啟動中...'):
-            df['成分英文名'] = df['成分日文名'].apply(process_line)
-            df['來源'] = "Auto_Logic_PubChem"
-        st.success("✅ 處理完成！")
-        st.dataframe(df)
-        csv = df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下載全自動對應 CSV", csv, "Medicine_Auto_Final.csv")
+    df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
+    
+    if st.button("🚀 啟動 KEGG 數據庫檢索"):
+        with st.spinner('正在連線至日本 KEGG 伺服器...'):
+            # 執行對照
+            df['成分英文名'] = df['成分日文名'].apply(fetch_kegg_english)
+            df['來源'] = "External_KEGG_Official"
+            
+        st.success("✅ 檢索完成！")
+        st.dataframe(df, use_container_width=True)
+        
+        csv_data = df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button("📥 下載 KEGG 對照完成版", csv_data, "Medicine_KEGG_Result.csv")
