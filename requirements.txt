@@ -1,7 +1,6 @@
 streamlit
-pdfplumber
 pandas
 requests
 beautifulsoup4
 xlsxwriter
-lxml
+openpyxl
