@@ -6,6 +6,7 @@ import re
 # --- 1. 官方精確對照大字典 (已根據 JAPIC 標準校對) ---
 # 這裡包含了您清單中 505 項的高頻核心成分
 OFFICIAL_MASTER_DB = {
+    # --- 1. 原本已成功的項目 ---
     "ワルファリンカリウム": "Warfarin Potassium",
     "シクロスポリン": "Ciclosporin",
     "タクロリムス水和物": "Tacrolimus Hydrate",
@@ -19,16 +20,34 @@ OFFICIAL_MASTER_DB = {
     "ノルアドレナリン": "Noradrenaline",
     "スガマデクスナトリウム": "Sugammadex Sodium",
     "メトトレキサート": "Methotrexate",
-    "リドカイン塩酸塩": "Lidocaine Hydrochloride",
-    "リファンピシン": "Rifampicin",
-    "レボフロキサシン水和物": "Levofloxacin Hydrate",
-    "リネゾリド": "Linezolid",
     "バンコマイシン塩酸塩": "Vancomycin Hydrochloride",
+
+    # --- 2. 新增：抗生素與抗病毒 (611-625系列) ---
     "アモキシシリン水和物": "Amoxicillin Hydrate",
     "セファゾリンナトリウム": "Cefazolin Sodium",
+    "セフトリアキソンナトリウム水和物": "Ceftriaxone Sodium Hydrate",
     "メロペネム水和物": "Meropenem Hydrate",
+    "イミペネム水和物": "Imipenem Hydrate",
+    "シラスタチンナトリウム": "Cilastatin Sodium",
+    "ゲンタマイシン硫酸塩": "Gentamicin Sulfate",
+    "クラリスロマイシン": "Clarithromycin",
+    "アシクロビル": "Aciclovir",
+    "ガンシクロビル": "Ganciclovir",
+    "レムデシビル": "Remdesivir",
+    "レボフロキサシン水和物": "Levofloxacin Hydrate",
+    "シプロフロキサシン": "Ciprofloxacin",
+
+    # --- 3. 新增：代謝與循環藥 (211-399系列) ---
+    "ニトログリセリン": "Nitroglycerin",
     "ニカルジピン塩酸塩": "Nicardipine Hydrochloride",
     "アムロジピンベシル酸塩": "Amlodipine Besilate",
+    "リバーロキサバン": "Rivaroxaban",
+    "アピキサバン": "Apixaban",
+    "エドキサバントシル酸塩水和物": "Edoxaban Tosilate Hydrate",
+    "インスリン　ヒト": "Insulin Human",
+    "メトホルミン塩酸塩": "Metformin Hydrochloride",
+
+    # --- 4. 新增：外用與呼吸道 (已成功部分保留) ---
     "肺サーファクタント": "Pulmonary Surfactant",
     "イプラトロピウム臭化物": "Ipratropium Bromide",
     "クロモグリク酸ナトリウム": "Sodium Cromoglicate",
