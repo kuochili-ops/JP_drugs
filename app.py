@@ -68,38 +68,41 @@ def parse_full_medicine_pdf(file):
         for page in pdf.pages:
             text = page.extract_text() or ""
             
-            # 1. 判定類別 (Category A, B, C)
-            if "(1)" in text or "カテゴリA" in text: current_cat = "Cat A"
-            elif "(2)" in text or "カテゴリB" in text: cat = "Cat B"
-            elif "(3)" in text or "カテゴリC" in text: current_cat = "Cat C"
+            # 1. 判定類別
+            if "(1)" in text: current_cat = "Cat A"
+            elif "(2)" in text: current_cat = "Cat B"
+            elif "(3)" in text: current_cat = "Cat C"
 
-            # 2. 以您建議的「文字定標法」進行掃描
             lines = text.split('\n')
             for line in lines:
                 line = line.strip()
+                if not line or "成分名" in line: continue
                 
-                # 正規表達式邏輯：
-                # ^(内|注|外)      -> 必須以 內、注 或 外 開頭
-                # \s* -> 中間可能有空格
-                # (\d{3})          -> 接續 3 位數字 (用途編號)
-                # \s* -> 中間可能有空格
-                # ([^\d]+)         -> 後面剩餘的所有非數字文字 (日文成分名)
+                # 核心 Regex：匹配 (給藥方式) (3位編號) (成分名)
                 match = re.search(r'^(内|注|外)\s*(\d{3})\s*(.+)$', line)
                 
                 if match:
+                    # 發現新藥項：建立紀錄
                     route, code, name = match.groups()
-                    
-                    # 清理名稱：移除可能夾雜在末尾的頁碼或雜訊數字
-                    name = re.sub(r'\s*\d+$', '', name).strip()
-                    
-                    # 確保不重複抓取
-                    if not any(d['成分日文名'] == name for d in all_data):
-                        all_data.append({
-                            "類別": current_cat,
-                            "給藥方式": route,
-                            "用途類別": code,
-                            "成分日文名": name
-                        })
+                    all_data.append({
+                        "類別": current_cat,
+                        "給藥方式": route,
+                        "用途類別": code,
+                        "成分日文名": name.strip()
+                    })
+                else:
+                    # 跨行處理：如果這行不符合錨點，但我們已經有上一筆紀錄
+                    # 且這行看起來不像是頁碼或標題，就合併到上一筆的成分名中
+                    if all_data and not re.match(r'^\d+$', line): # 排除純頁碼行
+                        # 檢查這行是否包含特定關鍵字，避免誤抓標題
+                        if len(line) > 1 and "厚生労働省" not in line:
+                            all_data[-1]["成分日文名"] += line.strip()
+
+    # 最終清洗：處理合併後可能產生的重複空格或雜訊
+    for item in all_data:
+        item["成分日文名"] = re.sub(r'\s+', '', item["成分日文名"])
+        # 移除可能誤抓到的結尾頁碼數字
+        item["成分日文名"] = re.sub(r'\d+$', '', item["成分日文名"])
     
     return pd.DataFrame(all_data)
 # --- 4. Streamlit UI 介面 ---
