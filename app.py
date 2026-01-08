@@ -1,73 +1,54 @@
 import streamlit as st
 import pandas as pd
-import requests
-import re
-from urllib.parse import quote
+import io
 
-def get_official_inn_via_kegg(ja_name):
+# --- 核心邏輯：AI 提示詞工程 ---
+def generate_prompt(drug_list):
     """
-    透過 KEGG API 直接將日文片假名轉換為官方英文名 (INN)
+    生成一個專業的指令，讓 AI 幫您完成對照
     """
-    if not ja_name or pd.isna(ja_name):
-        return "N/A"
-
-    # 清除括號內的品牌名，避免干擾匹配
-    clean_ja = re.sub(r'[\(\（].*?[\)\）]', '', str(ja_name)).strip()
+    prompt = """
+    你是一位專業的藥劑師與醫學翻譯專家。請將以下日文藥品成分名轉換為標準的國際非專利藥名 (INN) 或 JAN 英文名。
+    要求：
+    1. 僅回傳英文成分名，多個成分用 ' / ' 分隔。
+    2. 確保化學鹽類（如塩酸塩、硫酸塩）翻譯正確（Hydrochloride, Sulfate 等）。
+    3. 格式請保持與輸入順序一致。
     
-    # 處理複合劑：拆分後分別查詢再合併
-    if '･' in clean_ja or '・' in clean_ja:
-        parts = re.split(r'[･・]', clean_ja)
-        return " / ".join([get_official_inn_via_kegg(p) for p in parts])
-
-    try:
-        # 第一步：直接搜尋日文名稱對應的 KEGG ID
-        # 這是日本官方提供的 find 接口
-        search_url = f"https://rest.kegg.jp/find/drug/{quote(clean_ja)}"
-        response = requests.get(search_url, timeout=5)
-        
-        if response.status_code == 200 and response.text.strip():
-            # 獲取搜尋結果的第一筆 ID (例如 dr:D00544)
-            kegg_id = response.text.split('\t')[0]
-            
-            # 第二步：獲取該 ID 的詳細資料
-            info_url = f"https://rest.kegg.jp/get/{kegg_id}"
-            info_resp = requests.get(info_url, timeout=5)
-            
-            if info_resp.status_code == 200:
-                lines = info_resp.text.split('\n')
-                for line in lines:
-                    # 搜尋「NAME」欄位中的英文括號部分
-                    if line.startswith('NAME'):
-                        # 格式通常為：NAME  ミダゾラム (Midazolam)
-                        match = re.search(r'\((.*?)\)', line)
-                        if match:
-                            # 提取第一個分號前的名稱 (即主成分名)
-                            return match.group(1).split(';')[0].strip()
-        
-        return f"[未查獲] {clean_ja}"
-
-    except Exception as e:
-        return f"[連線錯誤] {clean_ja}"
+    待處理清單：
+    """
+    return prompt + "\n".join(drug_list)
 
 # --- UI 介面 ---
 st.set_page_config(layout="wide")
-st.title("🛡️ 505項官方對照：KEGG API 權威版")
-st.info("本引擎放棄搜尋引擎爬蟲，改由日本 KEGG 官方 API 直接進行名稱解析。")
+st.title("🤖 AI Mode 醫藥對照助手")
+st.markdown("參考您分享的 AI 模式，利用大語言模型的醫藥知識庫直接完成 505 項對照。")
 
-f = st.file_uploader("上傳您目前的 CSV", type=['csv'])
+f = st.file_uploader("上傳您的 505 項 CSV", type=['csv'])
 
 if f:
     df = pd.read_csv(f)
-    # 移除之前失敗的測試欄位
-    df = df.loc[:, ~df.columns.str.contains('^Unnamed|來源|成分英文名')]
+    # 預覽數據
+    st.write("### 原始數據預覽", df.head(10))
     
-    if st.button("🚀 啟動官方 API 全量解析"):
-        with st.spinner('正在與日本官方伺服器連線...'):
-            df['成分英文名'] = df['成分日文名'].apply(get_official_inn_via_kegg)
-            df['來源'] = "Official_KEGG_API"
-            
-        st.success("✅ 解析完畢！")
-        st.dataframe(df, use_container_width=True)
+    batch_size = 50  # 建議分批處理以確保準確度
+    if st.button(f"🚀 生成 AI 處理指令 (每批 {batch_size} 項)"):
+        # 我們將 505 項拆分成幾組，方便您貼入 AI (如 Gemini/ChatGPT)
+        drug_names = df['成分日文名'].tolist()
         
-        csv_data = df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下載最終對照版 CSV", csv_data, "Medicine_Final_Official.csv")
+        for i in range(0, len(drug_names), batch_size):
+            batch = drug_names[i:i + batch_size]
+            st.write(f"#### 第 {i//batch_size + 1} 批次指令 (第 {i+1} 至 {min(i+batch_size, 505)} 項)")
+            st.code(generate_prompt(batch), language="text")
+            st.info("請將上方代碼複製並貼入 AI 視窗，完成後將結果貼回下方表格。")
+
+    # 提供一個編輯區讓使用者貼回結果
+    st.write("---")
+    st.write("### 📥 貼回 AI 處理結果")
+    if '成分英文名' not in df.columns:
+        df['成分英文名'] = ""
+    
+    edited_df = st.data_editor(df, use_container_width=True)
+    
+    if st.button("💾 匯出最終完美版 CSV"):
+        csv_data = edited_df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button("📥 下載對照完成檔案", csv_data, "Medicine_AI_Final_Fixed.csv")
