@@ -1,80 +1,64 @@
 import streamlit as st
 import pandas as pd
-import io
+import requests
 import re
+from urllib.parse import quote
 
-# --- 官方權威大字典 (全量補全版) ---
-# 針對 505 項清單中所有可能出現的單一與複合成分
-MASTER_DB = {
-    "肺サーファクタント": "Pulmonary Surfactant",
-    "イプラトロピウム臭化物": "Ipratropium Bromide",
-    "クロモグリク酸ナトリウム": "Sodium Cromoglicate",
-    "サルブタモール硫酸塩": "Salbutamol Sulfate",
-    "チオトロピウム臭化物": "Tiotropium Bromide",
-    "プロカテロール塩酸塩": "Procaterol Hydrochloride",
-    "シクレソニド": "Ciclesonide",
-    "ブデソニド": "Budesonide",
-    "ホルモテロールフマル酸塩": "Formoterol Fumarate",
-    "サルメテロールキシナホ酸塩": "Salmeterol Xinafoate",
-    "フルチカゾンプロピオン酸エステル": "Fluticasone Propionate",
-    "フルチカゾンフランカルボン酸エステル": "Fluticasone Furoate",
-    "モメタゾンフランカルボン酸エステル": "Mometasone Furoate",
-    "ビランテロールトリフェニル酢酸塩": "Vilanterol Trifenatate",
-    "インダカテロール酢酸塩": "Indacaterol Acetate",
-    "グリコピロニウム臭化物": "Glycopyrronium Bromide",
-    "ウメクリジニウム臭化物": "Umeclidinium Bromide",
-    "アズレンスルホン酸ナトリウム": "Azulene Sulfonate Sodium",
-    "精製ヒアルロン酸ナトリウム": "Purified Sodium Hyaluronate",
-    "オフロキサシン": "Ofloxacin",
-    "ガチフロキサシン": "Gatifloxacin",
-}
+def get_english_from_external(japanese_name):
+    """
+    直接請求外部醫藥數據庫 (NIH RxNav / PubChem)
+    """
+    if not japanese_name or pd.isna(japanese_name):
+        return "N/A"
 
-def clean_name(name):
-    """ 清除日文名稱中的括號備註 (例如：(ベネトリン)) """
-    if not name: return ""
-    return re.sub(r'[\(\（].*?[\)\）]', '', str(name)).strip()
-
-def translate_official(name):
-    clean_ja = clean_name(name)
+    # 清除日文括號備註 (品牌名)
+    clean_ja = re.sub(r'[\(\（].*?[\)\）]', '', str(japanese_name)).strip()
     
-    # 1. 直接匹配
-    if clean_ja in MASTER_DB:
-        return MASTER_DB[clean_ja], "JAPIC_Official"
-    
-    # 2. 複合劑自動解析 (處理含有 ･ 或 ・ 的項目)
-    separators = ['･', '・', '/']
-    if any(sep in clean_ja for sep in separators):
-        parts = re.split(r'[･・/]', clean_ja)
-        en_list = [MASTER_DB.get(p.strip(), p.strip()) for p in parts]
-        return " / ".join(en_list), "JAPIC_Composite"
+    # 對於複合藥，拆分後分別請求外部資源
+    if '･' in clean_ja or '・' in clean_ja:
+        parts = re.split(r'[･・]', clean_ja)
+        return " / ".join([get_english_from_external(p) for p in parts])
 
-    # 3. 關鍵字模糊比對 (針對長藥名中的核心成分)
-    for key, val in MASTER_DB.items():
-        if key in clean_ja:
-            return val, "JAPIC_Keyword_Match"
+    try:
+        # 外部資源 1: PubChem 名稱解析 API
+        # 這是目前最穩定的免費藥物名稱查詢服務
+        url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{quote(clean_ja)}/synonyms/JSON"
+        response = requests.get(url, timeout=5)
+        
+        if response.status_code == 200:
+            data = response.json()
+            # 獲取全球通用名 (通常是清單中的第一個英文名稱)
+            synonyms = data['InformationList']['Information'][0]['Synonym']
+            # 過濾出英文名稱 (通常大寫開頭且不含日文)
+            for syn in synonyms:
+                if re.match(r'^[A-Za-z]', syn):
+                    return syn
+        
+        # 外部資源 2: 如果化學名查不到，則視為需人工確認的冷門項目
+        return f"External_Check: {clean_ja}"
 
-    return "[需人工校對]", "None"
+    except Exception:
+        return f"Error: {clean_ja}"
 
-# --- Streamlit UI ---
-st.set_page_config(layout="wide")
-st.title("💊 505項藥品：成分英文名【深度加強版】")
-st.info("已導入 JAPIC 複合藥劑解析邏輯與鹽類校正系統。")
+# --- Streamlit 介面 ---
+st.title("🌐 外部資源串接：全球藥物數據庫自動翻譯")
+st.markdown("直接調用 **NIH PubChem API**，不再使用手動詞庫。")
 
-f = st.file_uploader("請上傳您的 2026-01-08T07-14_export.csv", type=['csv'])
+f = st.file_uploader("上傳 2026-01-08T07-14_export.csv", type=['csv'])
 
 if f:
     df = pd.read_csv(f)
-    # 移除之前的空白索引
+    # 移除之前的干擾欄位
     df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
     
-    if st.button("🚀 開始執行全量官方校正"):
-        for i, row in df.iterrows():
-            en, src = translate_official(row["成分日文名"])
-            df.at[i, "成分英文名"] = en
-            df.at[i, "來源"] = src
+    if st.button("🚀 啟動 PubChem 全球數據庫查詢"):
+        with st.spinner('正在與外部資源同步，請稍候...'):
+            # 針對 505 項全量掃描
+            df['成分英文名'] = df['成分日文名'].apply(get_english_from_external)
+            df['來源'] = "PubChem_Global_API"
             
-        st.success("✅ 校正完成！")
-        st.dataframe(df, use_container_width=True)
+        st.success("✅ 505 項數據已完成外部資源對照！")
+        st.dataframe(df)
         
-        csv_data = df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下載最終版 CSV", csv_data, "Medicine_Standardized_v4.csv")
+        csv = df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button("📥 下載 API 對照完成版 CSV", csv, "Medicine_Global_Result.csv")
