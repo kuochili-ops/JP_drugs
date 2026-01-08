@@ -64,40 +64,50 @@ def get_english_name(jp_name):
 
     return "[翻譯失敗]", "None"
 
-def parse_medicine_pdf(file):
-    """ 解析 PDF 並精確對位 506 項 """
+def parse_full_506(file):
     all_data = []
-    cat = "未知"
+    current_cat = "未知"
+    
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
-            if "(1)" in text: cat = "Cat A"
-            elif "(2)" in text: cat = "Cat B"
-            elif "(3)" in text: cat = "Cat C"
+            # 更新類別判定
+            if "(1)" in text: current_cat = "Cat A"
+            elif "(2)" in text: current_cat = "Cat B"
+            elif "(3)" in text: current_cat = "Cat C"
 
-            # 1. 表格解析
-            ts = page.extract_tables()
-            for t in ts:
-                for r in t:
-                    if len(r) >= 3 and any(x in str(r[0]) for x in ['内','注','外']):
-                        all_data.append({
-                            "類別": cat,
-                            "給藥方式": re.sub(r'\s+', '', str(r[0])),
-                            "用途類別": str(r[1]).strip().split('\n')[0],
-                            "成分日文名": str(r[2]).strip().replace('\n', '')
-                        })
-            
-            # 2. 文字行解析 (補足 Page 11+)
+            # 策略 A: 抓取標準表格 (前10頁)
+            tables = page.extract_tables()
+            for table in tables:
+                for row in table:
+                    if len(row) >= 3:
+                        route_raw = str(row[0])
+                        # 只要包含關鍵字就抓取
+                        if any(r in route_raw for r in ['内', '注', '外']):
+                            clean_route = "".join(set(re.findall(r'内|注|外', route_raw)))
+                            all_data.append({
+                                "類別": current_cat,
+                                "給藥方式": clean_route,
+                                "用途類別": str(row[1]).strip().split('\n')[0],
+                                "成分日文名": str(row[2]).strip().replace('\n', '')
+                            })
+
+            # 策略 B: 針對第11頁後的「純文字行」進行 Regex 補抓
             lines = text.split('\n')
-            for l in lines:
-                m = re.search(r'^(内|注|外)\s+(\d{3})\s+(.+)$', l.strip())
-                if m:
-                    route, code, name = m.groups()
+            for line in lines:
+                # 匹配格式：給藥方式(内/注/外) + 3位數字 + 成分名
+                match = re.search(r'^(内|注|外)\s+(\d{3})\s+(.+)$', line.strip())
+                if match:
+                    route, code, name = match.groups()
+                    # 檢查重複，避免與策略 A 抓到的重疊
                     if not any(d['成分日文名'] == name for d in all_data):
-                        all_data.append({"類別": cat, "給藥方式": route, "用途類別": code, "成分日文名": name})
-                        
+                        all_data.append({
+                            "類別": current_cat,
+                            "給藥方式": route,
+                            "用途類別": code,
+                            "成分日文名": name
+                        })
     return pd.DataFrame(all_data)
-
 # --- 3. Streamlit UI ---
 st.title("💊 506項藥品全解析 (Azure 優先模式)")
 
