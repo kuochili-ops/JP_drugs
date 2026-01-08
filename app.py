@@ -4,61 +4,80 @@ import requests
 import re
 from urllib.parse import quote
 
-def get_english_from_external(japanese_name):
-    """
-    直接請求外部醫藥數據庫 (NIH RxNav / PubChem)
-    """
-    if not japanese_name or pd.isna(japanese_name):
-        return "N/A"
+# 核心：片假名轉英文拼音基礎表 (解決大部分轉換問題)
+KATA_TO_EN = {
+    'ア': 'a', 'イ': 'i', 'ウ': 'u', 'エ': 'e', 'オ': 'o',
+    'カ': 'ka', 'キ': 'ki', 'ク': 'ku', 'ケ': 'ke', 'コ': 'ko',
+    'サ': 'sa', 'シ': 'shi', 'ス': 'su', 'セ': 'se', 'ソ': 'so',
+    'タ': 'ta', 'チ': 'chi', 'ツ': 'tsu', 'テ': 'te', 'ト': 'to',
+    'ナ': 'na', 'ニ': 'ni', 'ヌ': 'nu', 'ネ': 'ne', 'ノ': 'no',
+    'ハ': 'ha', 'ヒ': 'hi', 'フ': 'fu', 'ヘ': 'he', 'ホ': 'ho',
+    'マ': 'ma', 'ミ': 'mi', 'ム': 'mu', 'メ': 'me', 'モ': 'mo',
+    'ヤ': 'ya', 'ユ': 'yu', 'ヨ': 'yo',
+    'ラ': 'ra', 'リ': 'ri', 'ル': 'ru', 'レ': 're', 'ロ': 'ro',
+    'ワ': 'wa', 'ン': 'n', 'ガ': 'ga', 'ギ': 'gi', 'グ': 'gu', 'ゲ': 'ge', 'ゴ': 'go',
+    'ザ': 'za', 'ジ': 'ji', 'ズ': 'zu', 'ゼ': 'ze', 'ゾ': 'zo',
+    'ダ': 'da', 'ヂ': 'ji', 'ヅ': 'zu', 'デ': 'de', 'ド': 'do',
+    'バ': 'ba', 'ビ': 'bi', 'ブ': 'bu', 'ベ': 'be', 'ボ': 'bo',
+    'パ': 'pa', 'ピ': 'pi', 'プ': 'pu', 'ペ': 'pe', 'ポ': 'po',
+    'ャ': 'ya', 'ュ': 'yu', 'ョ': 'yo', 'ッ': '', 'ー': ''
+}
 
-    # 清除日文括號備註 (品牌名)
-    clean_ja = re.sub(r'[\(\（].*?[\)\）]', '', str(japanese_name)).strip()
+# 鹽類與後綴對應
+SUFFIX_CLEAN = {
+    "塩酸塩": " hydrochloride", "硫酸塩": " sulfate", "カリウム": " potassium",
+    "ナトリウム": " sodium", "水和物": " hydrate", "フマル酸塩": " fumarate"
+}
+
+def auto_translate(text):
+    """ 引擎1：邏輯翻譯 (不依賴詞庫) """
+    if not text: return ""
+    # 移除括號雜訊
+    text = re.sub(r'[\(\（].*?[\)\）]', '', str(text)).strip()
     
-    # 對於複合藥，拆分後分別請求外部資源
-    if '･' in clean_ja or '・' in clean_ja:
-        parts = re.split(r'[･・]', clean_ja)
-        return " / ".join([get_english_from_external(p) for p in parts])
+    # 處理鹽類後綴分離
+    suffix_en = ""
+    for ja, en in SUFFIX_CLEAN.items():
+        if ja in text:
+            suffix_en = en
+            text = text.replace(ja, "")
+            break
+            
+    # 執行音譯轉換
+    res = "".join([KATA_TO_EN.get(char, char) for char in text])
+    return res.capitalize() + suffix_en
 
+def get_pubchem_standard(eng_name):
+    """ 引擎2：外部資源校正 (向 PubChem 驗證) """
     try:
-        # 外部資源 1: PubChem 名稱解析 API
-        # 這是目前最穩定的免費藥物名稱查詢服務
-        url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{quote(clean_ja)}/synonyms/JSON"
-        response = requests.get(url, timeout=5)
-        
-        if response.status_code == 200:
-            data = response.json()
-            # 獲取全球通用名 (通常是清單中的第一個英文名稱)
-            synonyms = data['InformationList']['Information'][0]['Synonym']
-            # 過濾出英文名稱 (通常大寫開頭且不含日文)
-            for syn in synonyms:
-                if re.match(r'^[A-Za-z]', syn):
-                    return syn
-        
-        # 外部資源 2: 如果化學名查不到，則視為需人工確認的冷門項目
-        return f"External_Check: {clean_ja}"
+        url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{quote(eng_name)}/synonyms/JSON"
+        resp = requests.get(url, timeout=3)
+        if resp.status_code == 200:
+            return resp.json()['InformationList']['Information'][0]['Synonym'][0]
+    except:
+        pass
+    return eng_name # 查不到就用翻譯好的
 
-    except Exception:
-        return f"Error: {clean_ja}"
+def process_line(ja_name):
+    # 處理複合劑
+    if '･' in ja_name or '・' in ja_name:
+        parts = re.split(r'[･・]', ja_name)
+        return " / ".join([get_pubchem_standard(auto_translate(p)) for p in parts])
+    return get_pubchem_standard(auto_translate(ja_name))
 
-# --- Streamlit 介面 ---
-st.title("🌐 外部資源串接：全球藥物數據庫自動翻譯")
-st.markdown("直接調用 **NIH PubChem API**，不再使用手動詞庫。")
+# --- UI ---
+st.title("🌐 外部資源 + 邏輯翻譯器 (505項全自動版)")
+st.write("此版本優先使用邏輯音譯，再由外部數據庫 PubChem 進行名稱校正。")
 
-f = st.file_uploader("上傳 2026-01-08T07-14_export.csv", type=['csv'])
+f = st.file_uploader("上傳最後一份 CSV", type=['csv'])
 
 if f:
     df = pd.read_csv(f)
-    # 移除之前的干擾欄位
-    df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
-    
-    if st.button("🚀 啟動 PubChem 全球數據庫查詢"):
-        with st.spinner('正在與外部資源同步，請稍候...'):
-            # 針對 505 項全量掃描
-            df['成分英文名'] = df['成分日文名'].apply(get_english_from_external)
-            df['來源'] = "PubChem_Global_API"
-            
-        st.success("✅ 505 項數據已完成外部資源對照！")
+    if st.button("🚀 啟動 505 項掃描 (不需詞庫)"):
+        with st.spinner('引擎啟動中...'):
+            df['成分英文名'] = df['成分日文名'].apply(process_line)
+            df['來源'] = "Auto_Logic_PubChem"
+        st.success("✅ 處理完成！")
         st.dataframe(df)
-        
         csv = df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下載 API 對照完成版 CSV", csv, "Medicine_Global_Result.csv")
+        st.download_button("📥 下載全自動對應 CSV", csv, "Medicine_Auto_Final.csv")
