@@ -1,64 +1,85 @@
+import streamlit as st
 import pandas as pd
 import requests
-import io
 import re
+import io
 
-# 1. 取得 KEGG 本地字典 (從您提供的 URL)
-@st.cache_data # 如果在 Streamlit 環境
-def get_kegg_dict():
+# --- 1. 從 KEGG 官網下載完整的日文對照字典 ---
+@st.cache_data
+def get_kegg_master_dict():
     url = "https://rest.kegg.jp/list/drug_ja/"
-    response = requests.get(url)
-    kegg_map = {}
-    if response.status_code == 200:
-        for line in response.text.strip().split('\n'):
-            parts = line.split('\t')
-            if len(parts) >= 2:
-                kegg_id = parts[0].replace('dr:', '')
-                # 名稱通常格式為: 日文名 (英文名); 其他名
-                names = parts[1]
-                jp_match = re.search(r'^(.+?)\s*\((.+?)\)', names)
-                if jp_match:
-                    jp_name = jp_match.group(1).strip()
-                    en_name = jp_match.group(2).strip()
-                    kegg_map[jp_name] = {"id": kegg_id, "en": en_name}
-    return kegg_map
+    try:
+        response = requests.get(url, timeout=10)
+        kegg_map = {}
+        if response.status_code == 200:
+            for line in response.text.strip().split('\n'):
+                parts = line.split('\t')
+                if len(parts) >= 2:
+                    k_id = parts[0].replace('dr:', '')
+                    # 格式通常為: 日文名 (英文名); 其他名
+                    full_name = parts[1]
+                    # 使用正則提取括號內的英文名
+                    match = re.search(r'^(.+?)\s*\((.+?)\)', full_name)
+                    if match:
+                        jp_name = match.group(1).strip()
+                        en_name = match.group(2).strip()
+                        kegg_map[jp_name] = {"id": k_id, "en": en_name}
+        return kegg_map
+    except Exception as e:
+        st.error(f"無法讀取 KEGG 字典: {e}")
+        return {}
 
-# 2. 核心翻譯與比對函數
-def process_data(input_csv_path, kegg_dict):
-    df = pd.read_csv(input_csv_path)
+# --- 2. 醫學術語翻譯對照表 (補充 Azure 漏掉的部分) ---
+TERM_MAP = {
+    "他に分類されない代謝性医薬品": "其他類別代謝藥物",
+    "血液凝固阻止剤": "抗凝血劑",
+    "薬効分類名": "藥效分類名稱",
+    "選定理由概要": "選定理由摘要",
+    "継続成分": "持續成分",
+    "新規成分": "新成分",
+    "内": "內服", "注": "注射", "外": "外用"
+}
+
+# --- 3. Streamlit 介面 ---
+st.set_page_config(page_title="藥品清單處理器", layout="wide")
+st.title("💊 藥品清單自動化處理 (KEGG + 翻譯)")
+
+# 預先載入 KEGG 字典
+kegg_dict = get_kegg_master_dict()
+
+uploaded_file = st.file_uploader("上傳您導出的 CSV 檔案", type="csv")
+
+if uploaded_file:
+    df = pd.read_csv(uploaded_file)
     
-    # 建立一個術語翻譯字典 (補足 Azure 沒翻到的部分)
-    term_map = {
-        "薬効分類": "藥效分類",
-        "選定理由概要": "選定理由摘要",
-        "血液凝固阻止剤": "抗凝血劑",
-        "他に分類されない代謝性医薬品": "其他類別代謝藥物",
-        "継続成分": "持續成分",
-        "新規成分": "新成分"
-    }
-
-    for idx, row in df.iterrows():
-        original_jp = str(row['成分名 (日)']).replace('\n', '').strip()
-        # 清理名稱（去除如 "水和物" 等括號）
-        clean_jp = re.sub(r'[（\(].*?[）\)]', '', original_jp)
+    if st.button("開始逐項比對與翻譯"):
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
-        # --- KEGG 比對 ---
-        if clean_jp in kegg_dict:
-            df.at[idx, 'KEGG_ID'] = kegg_dict[clean_jp]['id']
-            df.at[idx, '成分名 (英)'] = kegg_dict[clean_jp]['en']
-        
-        # --- 翻譯處理 (模擬 Azure 邏輯) ---
-        # 這裡針對整列的日文欄位進行替換
-        for col in df.columns:
-            if df.dtypes[col] == object:
-                val = str(df.at[idx, col])
-                for jp_term, tw_term in term_map.items():
-                    val = val.replace(jp_term, tw_term)
-                df.at[idx, col] = val
+        # 逐行處理
+        for i, row in df.iterrows():
+            # A. 處理成分名並比對 KEGG
+            raw_jp_name = str(row['成分名 (日)']).replace('\n', '').strip()
+            # 移除括號內容進行精準比對 (如: 水和物)
+            clean_jp_name = re.sub(r'[（\(].*?[）\)]', '', raw_jp_name)
+            
+            if clean_jp_name in kegg_dict:
+                df.at[i, 'KEGG_ID'] = kegg_dict[clean_jp_name]['id']
+                df.at[i, '成分名 (英)'] = kegg_dict[clean_jp_name]['en']
+            
+            # B. 處理其餘日文翻譯
+            for col in df.columns:
+                val = str(df.at[i, col])
+                for jp, tw in TERM_MAP.items():
+                    val = val.replace(jp, tw)
+                df.at[i, col] = val
+            
+            progress_bar.progress((i + 1) / len(df))
+            status_text.text(f"正在處理: {raw_jp_name}")
 
-    return df
+        status_text.success("處理完畢！")
+        st.dataframe(df)
 
-# 使用範例
-# kegg_lookup = get_kegg_dict()
-# final_df = process_data("2026-01-09T06-10_export.csv", kegg_lookup)
-# final_df.to_csv("fixed_data.csv", index=False, encoding="utf-8-sig")
+        # 下載按鈕
+        csv_data = df.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button("下載修正後的 CSV", data=csv_data, file_name="fixed_drugs.csv", mime="text/csv")
