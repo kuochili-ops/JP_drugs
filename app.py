@@ -4,54 +4,47 @@ import requests
 import re
 import uuid
 
-# --- 1. 初始化與環境設定 ---
-st.set_page_config(page_title="藥品清單補完工具", layout="wide")
+# --- 1. 初始化與 Azure 設定 ---
+st.set_page_config(page_title="藥品清單全效處理器", layout="wide")
 
-# Azure Translator 配置 (請填入您的資訊)
-AZURE_KEY = "您的_AZURE_KEY"
-AZURE_LOCATION = "您的_區域" # 例如 eastasia
+# 【重要】請務必填寫正確的 Azure 資訊
+AZURE_KEY = "您的_AZURE_SUBSCRIPTION_KEY"
+AZURE_LOCATION = "您的_區域" # 例如: eastasia
 AZURE_ENDPOINT = "https://api.cognitive.microsofttranslator.com"
 
-# --- 2. KEGG 字典模組：精確抓取分號後英文 ---
+# --- 2. 強化版 KEGG 字典模組 ---
 @st.cache_data(ttl=3600)
-def get_kegg_master_dict():
+def get_kegg_dict():
     url = "https://rest.kegg.jp/list/drug_ja/"
     kegg_map = {}
     try:
-        res = requests.get(url, timeout=15)
+        res = requests.get(url, timeout=20)
         if res.status_code == 200:
             for line in res.text.strip().split('\n'):
                 parts = line.split('\t')
                 if len(parts) >= 2:
                     k_id = parts[0].replace('dr:', '').strip()
-                    full_text = parts[1]
-                    
-                    # 格式：日文 (備註); 英文 (備註)
-                    if ';' in full_text:
-                        # 抓分號後的英文並移除 (JP18) 等標記
-                        en_raw = full_text.split(';')[1].strip()
+                    full_txt = parts[1]
+                    if ';' in full_txt:
+                        en_raw = full_txt.split(';')[1].strip()
                         en_name = re.sub(r'[\(\（].*?[\)\）]', '', en_raw).strip()
-                        
-                        # 抓分號前的日文作為 Key
-                        jp_raw = full_text.split(';')[0].strip()
+                        jp_raw = full_text = full_txt.split(';')[0].strip()
                         jp_name = re.sub(r'[\(\（].*?[\)\）]', '', jp_raw).strip()
-                        
                         kegg_map[jp_name] = {"id": k_id, "en": en_name}
         return kegg_map
-    except Exception as e:
-        st.error(f"KEGG 字典加載失敗: {e}")
+    except:
         return {}
 
-# --- 3. Azure 翻譯模組：處理長文本理由 ---
-def translate_via_azure(text):
+# --- 3. 專為「選定理由」設計的翻譯函數 ---
+def translate_reason_azure(text):
     if not text or pd.isna(text) or str(text).strip() == "":
         return ""
-    
-    # 重要：清洗換行符號，讓語意連貫
-    clean_text = str(text).replace('\n', ' ').strip()
-    
-    path = '/translate'
-    url = AZURE_ENDPOINT + path
+
+    # A. 文本清洗：移除所有換行符，這是翻譯成功的關鍵
+    clean_text = str(text).replace('\n', ' ').replace('\r', ' ').strip()
+    clean_text = re.sub(r'\s+', ' ', clean_text) # 壓縮空格
+
+    # B. Azure API 請求
     headers = {
         'Ocp-Apim-Subscription-Key': AZURE_KEY,
         'Ocp-Apim-Subscription-Region': AZURE_LOCATION,
@@ -62,58 +55,59 @@ def translate_via_azure(text):
     body = [{'text': clean_text}]
 
     try:
-        r = requests.post(url, params=params, headers=headers, json=body, timeout=10)
-        r.raise_for_status()
-        return r.json()[0]['translations'][0]['text']
-    except:
-        return f"[翻譯失敗] {clean_text}"
+        r = requests.post(f"{AZURE_ENDPOINT}/translate", params=params, headers=headers, json=body, timeout=15)
+        if r.status_code == 200:
+            return r.json()[0]['translations'][0]['text']
+        else:
+            return f"[API錯誤 {r.status_code}] {clean_text[:50]}..."
+    except Exception as e:
+        return f"[連線失敗] {clean_text[:50]}..."
 
-# --- 4. Streamlit UI 流程 ---
-st.title("💊 醫藥清單全自動處理 (KEGG + Azure)")
+# --- 4. UI 介面 ---
+st.title("💊 藥品清單從頭處理 (KEGG ID + 長文本翻譯)")
 
-# 預載字典
-kegg_dict = get_kegg_master_dict()
+k_dict = get_kegg_dict()
 
-uploaded_file = st.file_uploader("第一步：上傳您從 PDF 導出的 CSV", type="csv")
+uploaded_file = st.file_uploader("上傳您導出的 CSV", type="csv")
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
     
-    # 預備欄位
-    if 'KEGG_ID' not in df.columns: df['KEGG_ID'] = ""
-    if '成分名 (英)' not in df.columns: df['成分名 (英)'] = ""
+    # 預設欄位初始化
+    if 'KEGG_ID' not in df.columns: df['KEGG_ID'] = "N/A"
+    if '成分名 (英)' not in df.columns: df['成分名 (英)'] = "N/A"
     if '翻譯理由' not in df.columns: df['翻譯理由'] = ""
 
-    if st.button("第二步：開始全自動處理"):
+    if st.button("🚀 開始執行全自動處理"):
         progress_bar = st.progress(0)
         status = st.empty()
         
         for i, row in df.iterrows():
-            # A. 比對 KEGG
-            original_jp = str(row['成分名 (日)']).replace('\n', '').strip()
-            clean_jp = re.sub(r'[（\(].*?[）\)]', '', original_jp).strip()
+            # 1. KEGG 比對
+            jp_name_raw = str(row['成分名 (日)']).strip()
+            clean_jp = re.sub(r'[（\(].*?[）\)]', '', jp_name_raw).strip()
             
-            if clean_jp in kegg_dict:
-                df.at[i, 'KEGG_ID'] = kegg_dict[clean_jp]['id']
-                df.at[i, '成分名 (英)'] = kegg_dict[clean_jp]['en']
-            else:
-                df.at[i, 'KEGG_ID'] = "Not Found"
+            if clean_jp in k_dict:
+                df.at[i, 'KEGG_ID'] = k_dict[clean_jp]['id']
+                df.at[i, '成分名 (英)'] = k_dict[clean_jp]['en']
             
-            # B. 翻譯長文本 (選定理由摘要)
+            # 2. 翻譯「選定理由摘要」
             reason_jp = row.get('選定理由摘要', '')
-            df.at[i, '翻譯理由'] = translate_via_azure(reason_jp)
+            df.at[i, '翻譯理由'] = translate_reason_azure(reason_jp)
             
-            # C. 處理其他固定詞彙 (如藥效分類)
-            # (可依據之前提到的 TERM_MAP 進行替換)
+            # 3. 處理其他固定欄位 (藥效分類)
+            if '藥效分類' in df.columns:
+                df.at[i, '藥效分類'] = str(df.at[i, '藥效分類']).replace('血液凝固阻止剤', '抗凝血劑').replace('全身麻酔剤', '全身麻醉劑')
 
+            # 更新進度
             progress_bar.progress((i + 1) / len(df))
-            status.text(f"正在處理: {clean_jp}")
+            status.text(f"正在處理第 {i+1} 筆: {clean_jp}")
 
-        status.success("✅ 任務完成！")
+        status.success("✅ 處理完成！")
         
-        # 顯示結果
+        # 顯示關鍵結果
         st.dataframe(df[['區分', '成分名 (日)', '成分名 (英)', 'KEGG_ID', '翻譯理由']], use_container_width=True)
 
-        # 下載
-        csv = df.to_csv(index=False, encoding="utf-8-sig")
-        st.download_button("📥 下載最終完成檔案", csv, "final_med_data.csv", "text/csv")
+        # 下載按鈕
+        csv_final = df.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button("📥 下載最終處理 CSV", csv_final, "final_med_report.csv", "text/csv")
