@@ -5,28 +5,27 @@ import re
 import uuid
 import time
 
-# --- 1. 配置 ---
-st.set_page_config(page_title="Azure 翻譯診斷版", layout="wide")
+# --- 1. 設定區 ---
+st.set_page_config(page_title="Azure 翻譯 - 401 故障排除版", layout="wide")
 
-# 【請在此處填寫】務必確保這裡只有半形英數字
+# 【請從 Azure 控制台重新複製】
 AZURE_KEY = "您的_32位元金鑰" 
+AZURE_LOCATION = "eastasia" # 必須是小寫英文，例如 global, eastasia, westus
 AZURE_ENDPOINT = "https://api.cognitive.microsofttranslator.com"
-AZURE_LOCATION = "eastasia" # 必須是英文小寫，例如 global, eastasia, southeastasia
 
-# --- 2. 翻譯函數 ---
-def translate_diagnostic(text):
+# --- 2. 翻譯邏輯 (加入 401 錯誤診斷) ---
+def translate_final_check(text):
     if not text or pd.isna(text): return ""
     
-    # 1. 清理 Body 內容
-    clean_text = str(text).replace('[連線錯誤]', '').replace('[超時]', '').replace('\n', ' ').strip()
+    # 清理舊標籤並清洗文本
+    clean_text = str(text).replace('[HTTP 401]', '').replace('[連線失敗]', '').replace('\n', ' ').strip()
     clean_text = re.sub(r'\s+', ' ', clean_text)
-    if not clean_text: return ""
+    if not clean_text or len(clean_text) < 2: return clean_text
 
-    # 2. 準備 Headers (關鍵修正點：使用 .encode('ascii', 'ignore') 確保無非法字元)
+    # 強制清洗 Headers 確保無非 ASCII 字元
     try:
-        # 強制移除 Key 和 Location 中任何可能導致 latin-1 錯誤的非 ASCII 字元
-        safe_key = str(AZURE_KEY).encode('ascii', 'ignore').decode('ascii').strip()
-        safe_location = str(AZURE_LOCATION).encode('ascii', 'ignore').decode('ascii').strip()
+        safe_key = "".join(c for c in str(AZURE_KEY) if c.isalnum()).strip()
+        safe_location = "".join(c for c in str(AZURE_LOCATION) if c.islower() or c.isalpha()).strip()
         
         headers = {
             'Ocp-Apim-Subscription-Key': safe_key,
@@ -35,11 +34,12 @@ def translate_diagnostic(text):
             'X-ClientTraceId': str(uuid.uuid4())
         }
     except Exception as e:
-        return f"[Header 設定錯誤: {str(e)}]"
+        return f"[Header格式錯誤]"
 
-    # 3. 準備 URL 與分段
-    base_url = AZURE_ENDPOINT.strip().rstrip('/')
-    target_url = f"{base_url}/translate?api-version=3.0&from=ja&to=zh-Hant"
+    # 準備請求網址
+    target_url = f"{AZURE_ENDPOINT.strip().rstrip('/')}/translate?api-version=3.0&from=ja&to=zh-Hant"
+    
+    # 針對長文進行分段
     segments = re.split(r'(?<=。)|(?=（|\()', clean_text)
     segments = [s.strip() for s in segments if s.strip()]
 
@@ -49,42 +49,52 @@ def translate_diagnostic(text):
             r = requests.post(target_url, headers=headers, json=[{'text': seg}], timeout=25)
             if r.status_code == 200:
                 translated_parts.append(r.json()[0]['translations'][0]['text'])
+            elif r.status_code == 401:
+                return "[401 授權失敗: 請檢查金鑰是否正確]"
+            elif r.status_code == 403:
+                return f"[403 區域不符: 目前設定 {safe_location}，請檢查 Azure Portal]"
             else:
                 translated_parts.append(f"[HTTP {r.status_code}]")
-        except Exception as e:
-            translated_parts.append(f"[連線異常: {type(e).__name__}]")
-        time.sleep(0.2)
+        except Exception:
+            translated_parts.append("[連線超時]")
+        time.sleep(0.1)
         
     return " ".join(translated_parts)
 
 # --- 3. UI 介面 ---
-st.title("🛡️ Azure 翻譯最終修復測試")
+st.title("🛡️ Azure 翻譯最終修復測試 (前五項)")
 
-uploaded_file = st.file_uploader("上傳您原本的 CSV", type="csv")
+# 快速診斷
+if len(AZURE_KEY.strip()) != 32:
+    st.warning(f"⚠️ 警告：您的金鑰長度為 {len(AZURE_KEY.strip())} 位，標準金鑰應為 32 位英數字。請重新檢查。")
+
+uploaded_file = st.file_uploader("上傳您最新的 CSV", type="csv")
 
 if uploaded_file:
-    # 讀取並只取前五筆
     df_raw = pd.read_csv(uploaded_file).head(5)
     
-    if st.button("🚀 執行前五項翻譯測試"):
+    if st.button("🚀 開始測試前五項"):
         results = []
+        status = st.empty()
+        
         for i, row in df_raw.iterrows():
-            st.write(f"正在處理: {row['成分名 (日)']}...")
+            status.write(f"正在處理 ({i+1}/5): {row['成分名 (日)']}...")
             
-            # 抓取理由欄位 (檢查多個可能的名稱)
-            original_val = row.get('選定理由摘要') or row.get('翻譯理由') or ""
+            # 優先抓取日文原文
+            # 如果「翻譯理由」裡面已經滿是 [HTTP 401]，我們需要抓原始的理由欄位
+            # 假設原始日文欄位可能在「選定理由摘要」
+            original_val = row.get('選定理由摘要') or row.get('翻譯理由')
             
-            translated_val = translate_diagnostic(original_val)
+            translated_val = translate_final_check(original_val)
             results.append({
                 "成分名": row['成分名 (日)'], 
-                "處理結果": translated_val
+                "翻譯結果": translated_val
             })
         
         st.divider()
-        st.subheader("測試結果回報")
-        st.table(results)
+        st.subheader("處理結果")
+        res_df = pd.DataFrame(results)
+        st.table(res_df)
         
-        # 下載測試後的 CSV
-        test_out = pd.DataFrame(results)
-        csv = test_out.to_csv(index=False, encoding="utf-8-sig")
-        st.download_button("📥 下載此五項測試結果", csv, "debug_test.csv")
+        csv = res_df.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button("📥 下載測試結果", csv, "final_test_result.csv")
