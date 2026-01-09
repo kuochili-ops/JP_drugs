@@ -1,27 +1,29 @@
+import streamlit as st
 import pandas as pd
+import pdfplumber
 import requests
-import pdfplumber # 建議使用 pdfplumber 解析表格
 import time
+import io
 
-# 1. 設置 KEGG API 查詢函數
-def get_kegg_details(drug_name_jp):
-    """透過 KEGG API 獲取成分的英文名與 ID"""
+# --- 1. 功能函數定義 ---
+
+def get_kegg_info(drug_name_jp):
+    """查詢 KEGG API 獲取英文名與 ID"""
     try:
-        # 搜尋成分
-        search_url = f"https://rest.kegg.jp/find/drug/{drug_name_jp}"
-        r = requests.get(search_url, timeout=10)
-        if r.status_code == 200 and r.text.strip():
-            # 取第一筆結果
-            first_entry = r.text.split('\n')[0].split('\t')
-            kegg_id = first_entry[0].replace('dr:', '')
+        # 去掉括號內容以提高匹配率 (例如: ワルファリンカリウム -> ワルファリン)
+        clean_name = drug_name_jp.split('(')[0].split('（')[0].strip()
+        search_url = f"https://rest.kegg.jp/find/drug/{clean_name}"
+        res = requests.get(search_url, timeout=5)
+        if res.status_code == 200 and res.text.strip():
+            first_line = res.text.split('\n')[0].split('\t')
+            kegg_id = first_line[0].replace('dr:', '')
             
-            # 獲取詳細英文名稱
+            # 獲取詳細名稱
             info_url = f"https://rest.kegg.jp/get/{kegg_id}"
-            info_r = requests.get(info_url, timeout=10)
-            eng_name = "Unknown"
-            for line in info_r.text.split('\n'):
+            info_res = requests.get(info_url, timeout=5)
+            eng_name = "N/A"
+            for line in info_res.text.split('\n'):
                 if line.startswith('NAME'):
-                    # 提取第一個英文名並過濾掉日文
                     eng_name = line.replace('NAME', '').strip().split(';')[0]
                     break
             return kegg_id, eng_name
@@ -29,55 +31,81 @@ def get_kegg_details(drug_name_jp):
         pass
     return "N/A", "N/A"
 
-# 2. 定義 Azure 翻譯模擬 (或實際 API 呼叫)
-def translate_text(text):
-    # 這裡應換成您的 Azure Translator API 呼叫邏輯
-    # 範例僅做簡單術語替換或提示
+def translate_with_azure_logic(text):
+    """
+    此處模擬 Azure 翻譯邏輯。
+    實際使用請替換為 requests.post(azure_endpoint, ...)
+    """
+    # 簡易醫學術語對照表
     mapping = {
+        "継続成分": "持續成分", "新規成分": "新成分",
         "内": "內服", "注": "注射", "外": "外用",
-        "継続成分": "持續成分", "新規成分": "新成分"
+        "血液凝固阻止剤": "抗凝血劑", "全身麻酔剤": "全身麻醉劑",
+        "催眠鎮静剤": "催眠鎮靜劑", "選定理由概要": "選定理由摘要"
     }
     for k, v in mapping.items():
         text = text.replace(k, v)
     return text
 
-# 3. 讀取 PDF 並處理 (核心邏輯)
-def process_drug_pdf(file_path):
-    all_data = []
-    
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            table = page.extract_table()
-            if not table:
-                continue
+# --- 2. Streamlit 介面 ---
+
+st.title("藥品清單解析與 KEGG 對照工具")
+st.info("上傳 PDF 後，系統將自動解析表格並對接 KEGG 資料庫。")
+
+uploaded_file = st.file_uploader("上傳 PDF 檔案", type="pdf")
+
+if uploaded_file is not None:
+    try:
+        with st.spinner('正在解析 PDF 並查詢 KEGG API...'):
+            raw_rows = []
+            with pdfplumber.open(uploaded_file) as pdf:
+                for page in pdf.pages:
+                    table = page.extract_table()
+                    if table:
+                        # 假設第一行為標題，從第二行開始處理
+                        for row in table[1:]:
+                            if row[0] is None: continue # 跳過空行
+                            raw_rows.append(row)
             
-            # 跳過標頭檔 (假設第一列是標題)
-            for row in table[1:]:
-                # 確保列數正確 (根據您的 PDF 結構調整索引)
-                if len(row) < 7: continue
-                
-                jp_name = row[4].replace('\n', '') # 成分名
+            # 轉換為 DataFrame 並處理
+            processed_data = []
+            progress_bar = st.progress(0)
+            
+            for i, row in enumerate(raw_rows):
+                # 確保原始數據結構正確 (根據檔案調整索引)
+                # row[0]: 區分, row[1]: 途徑, row[3]: 分類名, row[4]: 成分名, row[6]: 理由
+                jp_name = str(row[4]).replace('\n', '')
                 
                 # 執行 KEGG 對照
-                k_id, en_name = get_kegg_details(jp_name)
+                k_id, en_name = get_kegg_info(jp_name)
                 
-                # 執行翻譯 (針對分類名與理由)
-                processed_row = {
-                    "區分": translate_text(row[0]),
-                    "途徑": translate_text(row[1]),
-                    "藥效代碼": row[2],
-                    "藥效分類": translate_text(row[3]),
-                    "成分名(日)": jp_name,
-                    "成分名(英)": en_name,
+                # 整合資料
+                processed_data.append({
+                    "區分": translate_with_azure_logic(row[0]),
+                    "給藥途徑": translate_with_azure_logic(row[1]),
+                    "藥效分類": translate_with_azure_logic(row[3]),
+                    "成分名 (日)": jp_name,
+                    "成分名 (英)": en_name,
                     "KEGG_ID": k_id,
-                    "理由摘要": translate_text(row[6]), # 選定理由
-                    "R7分類": row[7].strip() if row[7] else ""
-                }
-                all_data.append(processed_row)
-                time.sleep(0.1) # 避免 API 頻率過高
-                
-    return pd.DataFrame(all_data)
+                    "選定理由摘要": translate_with_azure_logic(row[6]),
+                    "R7年度分類案": row[7]
+                })
+                # 更新進度條
+                progress_bar.progress((i + 1) / len(raw_rows))
+            
+            final_df = pd.DataFrame(processed_data)
+            
+            st.success("處理完成！")
+            st.dataframe(final_df)
 
-# 執行處理
-# df = process_drug_pdf("001586778.pdf")
-# df.to_csv("processed_drugs.csv", index=False, encoding="utf-8-sig")
+            # CSV 下載按鈕
+            csv = final_df.to_csv(index=False, encoding="utf-8-sig")
+            st.download_button(
+                label="下載完整 CSV 檔案",
+                data=csv,
+                file_name="drug_list_kegg_translated.csv",
+                mime="text/csv",
+            )
+            
+    except Exception as e:
+        st.error(f"執行出錯: {e}")
