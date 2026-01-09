@@ -1,100 +1,75 @@
 import streamlit as st
 import pandas as pd
 import requests
+import uuid
 import re
 
-# 1. 確保 Streamlit 頁面設定
-st.set_page_config(page_title="藥品清單補完工具", layout="wide")
+# --- Azure Translator 設定 ---
+# 請在此填入您的 Azure 金鑰資訊
+AZURE_KEY = "您的_AZURE_SUBSCRIPTION_KEY"
+AZURE_ENDPOINT = "https://api.cognitive.microsofttranslator.com"
+AZURE_LOCATION = "您的_區域_例如_eastasia"
 
-# 2. 強化版字典抓取：精確切分分號後面的英文
-@st.cache_data(ttl=3600)
-def get_kegg_master_dict():
-    url = "https://rest.kegg.jp/list/drug_ja/"
-    kegg_map = {}
+def translate_long_text_azure(text):
+    """
+    專門處理長文本翻譯的函數
+    """
+    if not text or pd.isna(text) or str(text).strip() == "":
+        return ""
+
+    # 1. 文本清洗：移除 PDF 產生的換行符號，這對長文本翻譯至關重要
+    clean_text = str(text).replace('\n', ' ').replace('\r', '').strip()
+    # 壓縮多餘空白
+    clean_text = re.sub(r'\s+', ' ', clean_text)
+
+    # 2. Azure API 呼叫設定
+    path = '/translate'
+    constructed_url = AZURE_ENDPOINT + path
+    params = {
+        'api-version': '3.0',
+        'from': 'ja',
+        'to': 'zh-Hant' # 翻譯為繁體中文
+    }
+    headers = {
+        'Ocp-Apim-Subscription-Key': AZURE_KEY,
+        'Ocp-Apim-Subscription-Region': AZURE_LOCATION,
+        'Content-type': 'application/json',
+        'X-ClientTraceId': str(uuid.uuid4())
+    }
+    body = [{'text': clean_text}]
+
     try:
-        response = requests.get(url, timeout=20)
-        if response.status_code == 200:
-            lines = response.text.strip().split('\n')
-            for line in lines:
-                parts = line.split('\t')
-                if len(parts) >= 2:
-                    # 格式如 dr:D01280
-                    k_id = parts[0].replace('dr:', '').strip()
-                    full_text = parts[1]
-                    
-                    # 邏輯：ワルファリンカリウム (JP18); Warfarin potassium (JP18)
-                    if ';' in full_text:
-                        # 抓分號後面的英文
-                        en_part = full_text.split(';')[1].strip()
-                        en_name = re.sub(r'[\(\（].*?[\)\）]', '', en_part).strip()
-                        
-                        # 抓分號前的日文作為比對 Key
-                        jp_part = full_text.split(';')[0].strip()
-                        jp_name = re.sub(r'[\(\（].*?[\)\）]', '', jp_part).strip()
-                        
-                        kegg_map[jp_name] = {"id": k_id, "en": en_name}
-        return kegg_map
+        response = requests.post(constructed_url, params=params, headers=headers, json=body, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        return result[0]['translations'][0]['text']
     except Exception as e:
-        st.error(f"KEGG 字典讀取異常: {e}")
-        return {}
+        # 如果翻譯失敗，返回原樣並註記 (或進行簡易替換)
+        return f"[翻譯失敗] {clean_text}"
 
-# 3. 翻譯術語表
-TERM_MAP = {
-    "他に分類されない代謝性医薬品": "其他類別代謝藥物",
-    "血液凝固阻止剤": "抗凝血劑",
-    "薬効分類名": "藥效分類名稱",
-    "選定理由概要": "選定理由摘要",
-    "継続成分": "持續成分",
-    "新規成分": "新成分",
-    "内": "內服", "注": "注射", "外": "外用"
-}
+# --- 在 Streamlit 的按鈕執行邏輯內 ---
+if st.button("執行選定理由完整翻譯"):
+    with st.spinner('正在翻譯長文本理由，請稍候...'):
+        # 建立進度條
+        total = len(df)
+        progress_bar = st.progress(0)
+        
+        for i, row in df.iterrows():
+            # 針對「選定理由摘要」欄位進行處理
+            original_reason = row.get('選定理由摘要', '')
+            
+            # 呼叫 Azure 翻譯
+            translated_reason = translate_long_text_azure(original_reason)
+            
+            # 更新到 DataFrame
+            df.at[i, '選定理由摘要'] = translated_reason
+            
+            # 更新進度
+            progress_bar.progress((i + 1) / total)
+            
+        st.success("✅ 選定理由翻譯完成！")
+        st.dataframe(df)
 
-st.title("💊 藥品資料修正與 KEGG 對照")
-
-# 立即執行字典抓取
-kegg_lookup = get_kegg_master_dict()
-
-# 檢查字典是否抓到資料 (避免畫面白屏)
-if not kegg_lookup:
-    st.warning("⚠️ 正在嘗試從 KEGG 伺服器獲取資料，請稍候或重新整理。")
-
-uploaded_file = st.file_uploader("請上傳您的 CSV 檔案", type="csv")
-
-if uploaded_file:
-    df = pd.read_csv(uploaded_file)
-    
-    # 強制初始化欄位，避免欄位「不見」
-    if 'KEGG_ID' not in df.columns:
-        df['KEGG_ID'] = "Searching..."
-    if '成分名 (英)' not in df.columns:
-        df['成分名 (英)'] = "Searching..."
-
-    if st.button("開始執行精確對照"):
-        with st.spinner('正在比對 KEGG 數據庫...'):
-            for i, row in df.iterrows():
-                # 清理 CSV 中的日文名 (移除括號與換行)
-                raw_name = str(row['成分名 (日)']).replace('\n', '').strip()
-                clean_name = re.sub(r'[（\(].*?[）\)]', '', raw_name).strip()
-
-                # A. 比對字典
-                if clean_name in kegg_lookup:
-                    df.at[i, 'KEGG_ID'] = kegg_lookup[clean_name]['id']
-                    df.at[i, '成分名 (英)'] = kegg_lookup[clean_name]['en']
-                else:
-                    df.at[i, 'KEGG_ID'] = "Not Found"
-                    df.at[i, '成分名 (英)'] = "N/A"
-
-                # B. 翻譯替換
-                for col in df.columns:
-                    val = str(df.at[i, col])
-                    for jp, tw in TERM_MAP.items():
-                        if jp in val:
-                            val = val.replace(jp, tw)
-                    df.at[i, col] = val
-
-            st.success("✅ 處理完成")
-            st.dataframe(df, use_container_width=True)
-
-            # 下載功能
-            csv_out = df.to_csv(index=False, encoding="utf-8-sig")
-            st.download_button("📥 下載修正後的 CSV", csv_out, "final_drugs.csv", "text/csv")
+        # 提供下載
+        csv_data = df.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button("📥 下載翻譯完成的 CSV", csv_data, "translated_med_list.csv", "text/csv")
