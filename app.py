@@ -5,28 +5,31 @@ import re
 import uuid
 import time
 
-# --- 1. 核心配置 ---
-st.set_page_config(page_title="Azure 翻譯除錯工具", layout="wide")
+# --- 1. 配置與診斷 ---
+st.set_page_config(page_title="Azure 翻譯連線診斷", layout="wide")
 
-# 【請務必再次確認這三項】
+# 【請再次檢查這裡】
 AZURE_KEY = "您的_32位元金鑰"
+# 注意：Endpoint 通常只需要到 .com，後面的 path 程式會補
 AZURE_ENDPOINT = "https://api.cognitive.microsofttranslator.com"
-AZURE_LOCATION = "eastasia" # 請確認您的 Azure 資源是在哪個區域，例如 global 或 eastasia
+AZURE_LOCATION = "eastasia" 
 
-# --- 2. 強化翻譯函數 ---
-def translate_debug(text):
+# --- 2. 診斷型翻譯函數 ---
+def translate_diagnostic(text):
     if not text or pd.isna(text): return ""
     
-    # 清理：移除舊有的錯誤標記 [連線失敗]
-    clean_text = str(text).replace('[連線失敗]', '').replace('\n', ' ').strip()
-    # 壓縮空白
+    # 清理舊標籤
+    clean_text = str(text).replace('[連線錯誤]', '').replace('[超時]', '').replace('\n', ' ').strip()
     clean_text = re.sub(r'\s+', ' ', clean_text)
-    
     if not clean_text: return ""
 
-    # 按學會括號分割段落
-    segments = re.split(r'(?=（|\()', clean_text)
+    # 更細緻的切割（按句號或括號）
+    segments = re.split(r'(?<=。)|(?=（|\()', clean_text)
     segments = [s.strip() for s in segments if s.strip()]
+
+    # 確保 Endpoint 格式正確
+    base_url = AZURE_ENDPOINT.strip().rstrip('/')
+    target_url = f"{base_url}/translate?api-version=3.0&from=ja&to=zh-Hant"
 
     headers = {
         'Ocp-Apim-Subscription-Key': str(AZURE_KEY).strip(),
@@ -40,55 +43,50 @@ def translate_debug(text):
     for seg in segments:
         body = [{'text': seg}]
         try:
-            # 測試階段：使用 30 秒超時
-            res = requests.post(
-                f"{AZURE_ENDPOINT}/translate?api-version=3.0&from=ja&to=zh-Hant",
-                headers=headers,
-                json=body,
-                timeout=30
-            )
-            if res.status_code == 200:
-                translated_parts.append(res.json()[0]['translations'][0]['text'])
+            # 增加 verify=True 確保 SSL 安全連線
+            r = requests.post(target_url, headers=headers, json=body, timeout=20)
+            
+            if r.status_code == 200:
+                translated_parts.append(r.json()[0]['translations'][0]['text'])
             else:
-                translated_parts.append(f"[錯誤{res.status_code}]")
-        except Exception as e:
-            translated_parts.append(f"[連線錯誤]")
-        time.sleep(0.3) # 稍微停頓
+                # 這裡會顯示具體的 HTTP 狀態碼 (如 401, 403, 404)
+                translated_parts.append(f"[HTTP {r.status_code}]")
+        except requests.exceptions.RequestException as e:
+            # 這裡會顯示底層連線錯誤的原因
+            translated_parts.append(f"[連線異常: {type(e).__name__}]")
         
     return " ".join(translated_parts)
 
-# --- 3. UI 邏輯 ---
-st.title("🧪 Azure 翻譯極限除錯 (前五項測試)")
+# --- 3. UI 介面 ---
+st.title("🛡️ Azure Translator 深度診斷測試")
+st.info(f"目前設定區域: **{AZURE_LOCATION}** | 端點: **{AZURE_ENDPOINT}**")
 
-uploaded_file = st.file_uploader("上傳您的 export.csv", type="csv")
+uploaded_file = st.file_uploader("上傳 export.csv", type="csv")
 
 if uploaded_file:
-    # 讀取檔案
-    raw_df = pd.read_csv(uploaded_file)
-    # 強制只測前五筆
-    test_df = raw_df.head(5).copy()
+    df_raw = pd.read_csv(uploaded_file).head(5)
     
-    st.write("🔍 待測試項目：", test_df[['成分名 (日)']])
-
-    if st.button("🚀 開始測試"):
-        # 建立一個空容器顯示實時進度
-        progress_area = st.empty()
-        
-        for i, row in test_df.iterrows():
-            with progress_area.container():
-                st.write(f"正在翻譯第 {i+1} 筆：{row['成分名 (日)']}...")
-            
-            # 抓取原有的理由欄位（可能是「翻譯理由」或「選定理由摘要」）
+    if st.button("🔍 開始診斷翻譯"):
+        results = []
+        for i, row in df_raw.iterrows():
+            st.write(f"正在測試: {row['成分名 (日)']}...")
             original_val = row.get('翻譯理由') or row.get('選定理由摘要')
             
-            # 執行翻譯
-            test_df.at[i, '已修正翻譯'] = translate_debug(original_val)
-            
-        st.success("✅ 測試完成")
+            translated_val = translate_diagnostic(original_val)
+            results.append({"成分名": row['成分名 (日)'], "翻譯結果": translated_val})
         
-        # 顯示結果
-        st.dataframe(test_df[['成分名 (日)', '已修正翻譯']], use_container_width=True)
+        st.divider()
+        st.subheader("診斷結果")
+        st.table(results)
         
-        # 下載
-        csv = test_df.to_csv(index=False, encoding="utf-8-sig")
-        st.download_button("📥 下載這五項的結果", csv, "test_fix.csv")
+        # 故障排除指引
+        for res in results:
+            if "[HTTP 401]" in res['翻譯結果']:
+                st.error("❌ **錯誤 401**: 金鑰 (Key) 無效，請檢查是否複製完全。")
+                break
+            if "[HTTP 403]" in res['翻譯結果']:
+                st.error("❌ **錯誤 403**: 區域 (Location) 設定錯誤，請在 Azure Portal 確認 Region。")
+                break
+            if "[連線異常" in res['翻譯結果']:
+                st.warning("⚠️ **連線異常**: 可能是防火牆攔截或 Endpoint 網址錯誤。")
+                break
