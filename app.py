@@ -5,25 +5,28 @@ import re
 import uuid
 import time
 
-# --- 1. 基本配置 ---
-st.set_page_config(page_title="藥品翻譯測試版 (前五項)", layout="wide")
+# --- 1. 核心配置 ---
+st.set_page_config(page_title="Azure 翻譯除錯工具", layout="wide")
 
-# 【請檢查金鑰】
+# 【請務必再次確認這三項】
 AZURE_KEY = "您的_32位元金鑰"
 AZURE_ENDPOINT = "https://api.cognitive.microsofttranslator.com"
-AZURE_LOCATION = "eastasia" # 必須是英文小寫
+AZURE_LOCATION = "eastasia" # 請確認您的 Azure 資源是在哪個區域，例如 global 或 eastasia
 
-# --- 2. 核心翻譯函數 (強化分段與清洗) ---
-def translate_via_azure_test(text):
-    if not text or pd.isna(text) or str(text).strip() == "":
-        return ""
-
-    # 強力清洗換行符，避免 API 解析錯誤
-    clean_text = str(text).replace('\n', ' ').replace('\r', ' ').strip()
+# --- 2. 強化翻譯函數 ---
+def translate_debug(text):
+    if not text or pd.isna(text): return ""
     
-    # 按「學會括號」切分段落，這能把長文拆成多個小請求，徹底解決超時
+    # 清理：移除舊有的錯誤標記 [連線失敗]
+    clean_text = str(text).replace('[連線失敗]', '').replace('\n', ' ').strip()
+    # 壓縮空白
+    clean_text = re.sub(r'\s+', ' ', clean_text)
+    
+    if not clean_text: return ""
+
+    # 按學會括號分割段落
     segments = re.split(r'(?=（|\()', clean_text)
-    segments = [s for s in segments if s.strip()]
+    segments = [s.strip() for s in segments if s.strip()]
 
     headers = {
         'Ocp-Apim-Subscription-Key': str(AZURE_KEY).strip(),
@@ -31,57 +34,61 @@ def translate_via_azure_test(text):
         'Content-type': 'application/json',
         'X-ClientTraceId': str(uuid.uuid4())
     }
-    params = {'api-version': '3.0', 'from': 'ja', 'to': 'zh-Hant'}
     
-    translated_result = []
+    translated_parts = []
     
     for seg in segments:
         body = [{'text': seg}]
         try:
-            # 針對每一小段給予 30 秒等候
-            r = requests.post(f"{AZURE_ENDPOINT}/translate", params=params, headers=headers, json=body, timeout=30)
-            if r.status_code == 200:
-                translated_result.append(r.json()[0]['translations'][0]['text'])
+            # 測試階段：使用 30 秒超時
+            res = requests.post(
+                f"{AZURE_ENDPOINT}/translate?api-version=3.0&from=ja&to=zh-Hant",
+                headers=headers,
+                json=body,
+                timeout=30
+            )
+            if res.status_code == 200:
+                translated_parts.append(res.json()[0]['translations'][0]['text'])
             else:
-                translated_result.append(f"[錯誤{r.status_code}]")
-        except Exception:
-            translated_result.append("[超時]")
-        time.sleep(0.2) # 保護頻率
+                translated_parts.append(f"[錯誤{res.status_code}]")
+        except Exception as e:
+            translated_parts.append(f"[連線錯誤]")
+        time.sleep(0.3) # 稍微停頓
+        
+    return " ".join(translated_parts)
 
-    return " ".join(translated_result)
+# --- 3. UI 邏輯 ---
+st.title("🧪 Azure 翻譯極限除錯 (前五項測試)")
 
-# --- 3. UI 流程 ---
-st.title("🧪 藥品清單翻譯測試 (僅執行前五項)")
-
-uploaded_file = st.file_uploader("上傳您的 CSV 檔案", type="csv")
+uploaded_file = st.file_uploader("上傳您的 export.csv", type="csv")
 
 if uploaded_file:
-    # 讀取完整檔案
-    full_df = pd.read_csv(uploaded_file)
+    # 讀取檔案
+    raw_df = pd.read_csv(uploaded_file)
+    # 強制只測前五筆
+    test_df = raw_df.head(5).copy()
     
-    # 【測試核心】僅取前五項
-    df = full_df.head(5).copy()
-    
-    st.write("📋 偵測到檔案，將對以下前五項進行深度翻譯測試：")
-    st.table(df[['成分名 (日)', 'KEGG_ID']])
+    st.write("🔍 待測試項目：", test_df[['成分名 (日)']])
 
-    if st.button("🚀 開始測試前五項翻譯"):
-        df['翻譯理由'] = ""
-        progress_bar = st.progress(0)
+    if st.button("🚀 開始測試"):
+        # 建立一個空容器顯示實時進度
+        progress_area = st.empty()
         
-        for i, row in df.iterrows():
-            reason_jp = row.get('選定理由摘要') or row.get('翻譯理由') # 相容不同欄位名
-            # 執行翻譯
-            df.at[i, '翻譯理由'] = translate_via_azure_test(reason_jp)
+        for i, row in test_df.iterrows():
+            with progress_area.container():
+                st.write(f"正在翻譯第 {i+1} 筆：{row['成分名 (日)']}...")
             
-            progress_bar.progress((i + 1) / 5)
-            st.write(f"✅ 已完成: {row['成分名 (日)']}")
-
-        st.success("🎯 前五項測試完成！")
+            # 抓取原有的理由欄位（可能是「翻譯理由」或「選定理由摘要」）
+            original_val = row.get('翻譯理由') or row.get('選定理由摘要')
+            
+            # 執行翻譯
+            test_df.at[i, '已修正翻譯'] = translate_debug(original_val)
+            
+        st.success("✅ 測試完成")
         
-        # 顯示結果：特別拉寬顯示「翻譯理由」
-        st.dataframe(df[['成分名 (日)', 'KEGG_ID', '翻譯理由']], use_container_width=True)
-
-        # 下載測試結果
-        csv_test = df.to_csv(index=False, encoding="utf-8-sig")
-        st.download_button("📥 下載測試結果 CSV", csv_test, "test_top5.csv", "text/csv")
+        # 顯示結果
+        st.dataframe(test_df[['成分名 (日)', '已修正翻譯']], use_container_width=True)
+        
+        # 下載
+        csv = test_df.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button("📥 下載這五項的結果", csv, "test_fix.csv")
