@@ -1,94 +1,68 @@
 import streamlit as st
 import pandas as pd
-import requests
 import re
-import uuid
-import time
 
-# --- 1. 配置區 ---
-st.set_page_config(page_title="藥品清單翻譯系統 - 穩定版", layout="wide")
+st.set_page_config(page_title="藥品資料最終整合工具", layout="wide")
 
-# 已更新為您提供的新 Key
-AZURE_KEY = "9JDF24qrsW8rXiYmChS17yEPyNRI96nNXXqEKn5CyI6ql6iYcTOFJQQJ99BLAC3pKaRXJ3w3AAAbACOGVYVU"
-AZURE_LOCATION = "eastasia"  # 請根據您的 Azure 面板確認此區域 (例如 eastasia 或 global)
-AZURE_ENDPOINT = "https://api.cognitive.microsofttranslator.com"
+st.title("📂 藥品清單相同項目整合 (翻譯補完版)")
 
-# --- 2. 翻譯核心邏輯 (具備自動清理與分段功能) ---
-def translate_robust(text):
-    if not text or pd.isna(text): return ""
-    
-    # 【關鍵清理】移除上週產生的所有錯誤標籤，找回原始日文
-    clean_text = str(text)
-    error_patterns = [
-        r'\[連線失敗\]', r'\[超時\]', r'\[HTTP \d+\]', 
-        r'\[連線異常.*?\]', r'\[401.*?\]', r'\[錯誤.*?\]'
-    ]
-    for pattern in error_patterns:
-        clean_text = re.sub(pattern, '', clean_text)
-    
-    clean_text = clean_text.replace('\n', ' ').strip()
-    clean_text = re.sub(r'\s+', ' ', clean_text)
-    
-    if not clean_text or len(clean_text) < 2: return clean_text
+# 上傳兩個檔案
+file_trans = st.file_uploader("1. 上傳【已翻譯完成】的檔案 (translated_med_list.csv)", type="csv")
+file_raw = st.file_uploader("2. 上傳【原始導出】的檔案 (2026-01-09T06-10_export.csv)", type="csv")
 
-    # 準備 Headers
-    headers = {
-        'Ocp-Apim-Subscription-Key': AZURE_KEY.strip(),
-        'Ocp-Apim-Subscription-Region': AZURE_LOCATION.strip(),
-        'Content-type': 'application/json',
-        'X-ClientTraceId': str(uuid.uuid4())
-    }
-    target_url = f"{AZURE_ENDPOINT.strip().rstrip('/')}/translate?api-version=3.0&from=ja&to=zh-Hant"
+if file_trans and file_raw:
+    df_trans = pd.read_csv(file_trans)
+    df_raw = pd.read_csv(file_raw)
 
-    # 長文分段處理 (按句號或學會括號切分)
-    segments = re.split(r'(?<=。)|(?=（|\()', clean_text)
-    segments = [s.strip() for s in segments if s.strip()]
-
-    translated_parts = []
-    for seg in segments:
-        try:
-            r = requests.post(target_url, headers=headers, json=[{'text': seg}], timeout=30)
-            if r.status_code == 200:
-                translated_parts.append(r.json()[0]['translations'][0]['text'])
-            else:
-                translated_parts.append(f"[API錯誤: {r.status_code}]")
-        except:
-            translated_parts.append("[傳輸超時]")
-        time.sleep(0.1) # 保護頻率限制
+    if st.button("🔗 開始整合檔案"):
+        # 1. 準備翻譯對照表 (Key: 成分名 (日), Value: 翻譯理由)
+        # 我們只取有意義的翻譯結果
+        trans_map = df_trans.set_index('成分名 (日)')['翻譯理由'].to_dict()
         
-    return " ".join(translated_parts)
+        # 2. 準備原始檔案副本
+        df_final = df_raw.copy()
 
-# --- 3. UI 介面 ---
-st.title("💊 藥品資料翻譯補完工具")
-st.info("💡 系統會自動移除舊檔案中的錯誤標記，重新翻譯日文內容。")
-
-uploaded_file = st.file_uploader("上傳檔案 (例如 2026-01-09T07-14_export.csv)", type="csv")
-
-if uploaded_file:
-    df = pd.read_csv(uploaded_file)
-    st.write(f"✅ 成功讀取 {len(df)} 筆藥品資料。")
-
-    if st.button("🚀 開始執行全檔案翻譯"):
-        # 初始化或覆蓋翻譯欄位
-        if '翻譯理由' not in df.columns:
-            df['翻譯理由'] = ""
-        
-        progress_bar = st.progress(0)
-        status_msg = st.empty()
-        
-        for i, row in df.iterrows():
-            # 優先從「翻譯理由」或「選定理由摘要」抓取原始文字
-            input_text = row.get('翻譯理由') or row.get('選定理由摘要') or ""
-            df.at[i, '翻譯理由'] = translate_robust(input_text)
+        # 3. 執行回填
+        def get_clean_translation(row):
+            jp_name = row['成分名 (日)']
+            trans = trans_map.get(jp_name, "")
             
-            # 每處理 5 筆更新一次進度條
-            if i % 5 == 0 or i == len(df) - 1:
-                progress_bar.progress((i + 1) / len(df))
-                status_msg.text(f"正在處理 ({i+1}/{len(df)}): {row.get('成分名 (日)', '處理中')}")
+            if pd.isna(trans) or str(trans).strip() == "":
+                return ""
+            
+            # 清除殘留的錯誤標記 (防萬一)
+            error_patterns = [r'\[超時\]', r'\[HTTP \d+\]', r'\[連線失敗\]', r'\[連線異常.*?\]']
+            for pattern in error_patterns:
+                trans = re.sub(pattern, '', str(trans))
+            
+            return trans.strip()
 
-        st.success("🎉 全部翻譯任務完成！")
-        st.dataframe(df[['成分名 (日)', '翻譯理由']], use_container_width=True)
+        df_final['翻譯理由'] = df_final.apply(get_clean_translation, axis=1)
+
+        # 4. 處理 KEGG_ID 和 成分名 (英) 
+        # 如果原始檔是 N/A，則嘗試從翻譯檔補回 (如果有的話)
+        if 'KEGG_ID' in df_trans.columns:
+            kegg_map = df_trans.set_index('成分名 (日)')['KEGG_ID'].to_dict()
+            df_final['KEGG_ID'] = df_final['成分名 (日)'].map(kegg_map).fillna(df_final['KEGG_ID'])
         
-        # 下載按鈕
-        csv_out = df.to_csv(index=False, encoding="utf-8-sig")
-        st.download_button("📥 下載最終處理 CSV", csv_out, "translated_med_list.csv", "text/csv")
+        if '成分名 (英)' in df_trans.columns:
+            en_map = df_trans.set_index('成分名 (日)')['成分名 (英)'].to_dict()
+            df_final['成分名 (英)'] = df_final['成分名 (日)'].map(en_map).fillna(df_final['成分名 (英)'])
+
+        # 整理欄位順序，讓閱讀更直觀
+        cols = list(df_final.columns)
+        if '翻譯理由' in cols: # 把翻譯理由移到選定理由摘要後面
+            cols.insert(cols.index('選定理由摘要') + 1, cols.pop(cols.index('翻譯理由')))
+        df_final = df_final[cols]
+
+        st.success("🎉 整合完成！已成功對齊 763 筆項目。")
+        st.dataframe(df_final.head(10))
+
+        # 下載整合後的檔案
+        final_csv = df_final.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button(
+            label="📥 下載最終整合 CSV (完整版)",
+            data=final_csv,
+            file_name="Final_Drug_List_Merged.csv",
+            mime="text/csv"
+        )
