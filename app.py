@@ -1,68 +1,74 @@
 import streamlit as st
 import pandas as pd
+import requests
 import re
+import time
 
-st.set_page_config(page_title="藥品資料最終整合工具", layout="wide")
+st.set_page_config(page_title="KEGG 藥品名補完工具", layout="wide")
 
-st.title("📂 藥品清單相同項目整合 (翻譯補完版)")
+# --- 1. KEGG 字典抓取函數 ---
+@st.cache_data(ttl=3600)
+def get_kegg_dictionary():
+    url = "https://rest.kegg.jp/list/drug_ja/"
+    kegg_dict = {}
+    try:
+        response = requests.get(url, timeout=20)
+        if response.status_code == 200:
+            for line in response.text.strip().split('\n'):
+                parts = line.split('\t')
+                if len(parts) >= 2:
+                    k_id = parts[0].replace('dr:', '').strip()
+                    full_name = parts[1]
+                    # KEGG 格式通常是: 日文名; 英文名 [其他資訊]
+                    if ';' in full_name:
+                        jp_part, en_part = full_name.split(';', 1)
+                        # 清理括號
+                        clean_jp = re.sub(r'[\(\（].*?[\)\）]', '', jp_part).strip()
+                        clean_en = re.sub(r'[\(\（].*?[\)\）]', '', en_part).strip()
+                        kegg_dict[clean_jp] = {"id": f"dr:{k_id}", "en": clean_en}
+        return kegg_dict
+    except Exception as e:
+        st.error(f"無法連線至 KEGG API: {e}")
+        return {}
 
-# 上傳兩個檔案
-file_trans = st.file_uploader("1. 上傳【已翻譯完成】的檔案 (translated_med_list.csv)", type="csv")
-file_raw = st.file_uploader("2. 上傳【原始導出】的檔案 (2026-01-09T06-10_export.csv)", type="csv")
+# --- 2. UI 介面 ---
+st.title("🧪 KEGG API 藥品英文名與 ID 自動對照")
+st.info("系統將根據『成分名 (日)』自動對比 KEGG 資料庫，補完『成分名 (英)』與『KEGG_ID』。")
 
-if file_trans and file_raw:
-    df_trans = pd.read_csv(file_trans)
-    df_raw = pd.read_csv(file_raw)
+uploaded_file = st.file_uploader("上傳已整合的 CSV (Final_Drug_List_Merged.csv)", type="csv")
 
-    if st.button("🔗 開始整合檔案"):
-        # 1. 準備翻譯對照表 (Key: 成分名 (日), Value: 翻譯理由)
-        # 我們只取有意義的翻譯結果
-        trans_map = df_trans.set_index('成分名 (日)')['翻譯理由'].to_dict()
+if uploaded_file:
+    df = pd.read_csv(uploaded_file)
+    
+    if st.button("🔍 開始對照補完"):
+        kegg_data = get_kegg_dictionary()
         
-        # 2. 準備原始檔案副本
-        df_final = df_raw.copy()
-
-        # 3. 執行回填
-        def get_clean_translation(row):
-            jp_name = row['成分名 (日)']
-            trans = trans_map.get(jp_name, "")
-            
-            if pd.isna(trans) or str(trans).strip() == "":
-                return ""
-            
-            # 清除殘留的錯誤標記 (防萬一)
-            error_patterns = [r'\[超時\]', r'\[HTTP \d+\]', r'\[連線失敗\]', r'\[連線異常.*?\]']
-            for pattern in error_patterns:
-                trans = re.sub(pattern, '', str(trans))
-            
-            return trans.strip()
-
-        df_final['翻譯理由'] = df_final.apply(get_clean_translation, axis=1)
-
-        # 4. 處理 KEGG_ID 和 成分名 (英) 
-        # 如果原始檔是 N/A，則嘗試從翻譯檔補回 (如果有的話)
-        if 'KEGG_ID' in df_trans.columns:
-            kegg_map = df_trans.set_index('成分名 (日)')['KEGG_ID'].to_dict()
-            df_final['KEGG_ID'] = df_final['成分名 (日)'].map(kegg_map).fillna(df_final['KEGG_ID'])
+        progress_bar = st.progress(0)
+        status = st.empty()
         
-        if '成分名 (英)' in df_trans.columns:
-            en_map = df_trans.set_index('成分名 (日)')['成分名 (英)'].to_dict()
-            df_final['成分名 (英)'] = df_final['成分名 (日)'].map(en_map).fillna(df_final['成分名 (英)'])
+        # 轉換為清單加速處理
+        total = len(df)
+        for i, row in df.iterrows():
+            raw_jp = str(row['成分名 (日)']).strip()
+            # 移除日文名中的括號以便對照，例如：ワルファリンカリウム(JP18) -> ワルファリンカリウム
+            clean_jp = re.sub(r'[（\(].*?[）\)]', '', raw_jp).strip()
+            
+            if clean_jp in kegg_data:
+                df.at[i, 'KEGG_ID'] = kegg_data[clean_jp]['id']
+                df.at[i, '成分名 (英)'] = kegg_data[clean_jp]['en']
+            
+            if i % 20 == 0 or i == total - 1:
+                progress_bar.progress((i + 1) / total)
+                status.text(f"對照中: {clean_jp}")
 
-        # 整理欄位順序，讓閱讀更直觀
-        cols = list(df_final.columns)
-        if '翻譯理由' in cols: # 把翻譯理由移到選定理由摘要後面
-            cols.insert(cols.index('選定理由摘要') + 1, cols.pop(cols.index('翻譯理由')))
-        df_final = df_final[cols]
+        st.success("✅ 對照補完完成！")
+        st.dataframe(df[['成分名 (日)', '成分名 (英)', 'KEGG_ID', '翻譯理由']].head(10))
 
-        st.success("🎉 整合完成！已成功對齊 763 筆項目。")
-        st.dataframe(df_final.head(10))
-
-        # 下載整合後的檔案
-        final_csv = df_final.to_csv(index=False, encoding="utf-8-sig")
+        # 下載最終結果
+        final_csv = df.to_csv(index=False, encoding="utf-8-sig")
         st.download_button(
-            label="📥 下載最終整合 CSV (完整版)",
+            label="📥 下載對照補完後檔案",
             data=final_csv,
-            file_name="Final_Drug_List_Merged.csv",
+            file_name="Final_Drug_List_Full_Complete.csv",
             mime="text/csv"
         )
