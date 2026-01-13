@@ -1,67 +1,56 @@
 import pandas as pd
 import requests
-import io
 
 def fetch_and_fill_kegg_data(input_df):
-    """
-    input_df 必須包含 '品項名稱' 欄位
-    會補齊 'KEGG_ID' 與 '成分名_英' 欄位
-    """
-    # 1. 從 KEGG API 下載最新的日本醫藥品對照清單 (dr_ja)
+    # 1. 確保原始資料欄位名稱一致
+    # 這裡假設你的原始欄位是 'KEGG_ID' 和 '成分名 (英)'
+    
     print("正在從 KEGG 下載最新對照數據...")
     url = "https://rest.kegg.jp/list/dr_ja"
-    response = requests.get(url)
-    
-    if response.status_code != 200:
-        print("無法連接至 KEGG API")
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"無法連接至 KEGG API: {e}")
         return input_df
 
-    # 2. 解析 KEGG 原始數據 (格式為: ID \t 名稱1; 名稱2; (成分名英))
-    kegg_list = []
+    # 2. 解析 KEGG 原始數據
+    kegg_data = []
     for line in response.text.strip().split('\n'):
         parts = line.split('\t')
-        if len(parts) < 2:
-            continue
+        if len(parts) < 2: continue
         
-        kegg_id = parts[0].replace("dr:", "")
-        full_name = parts[1]
+        k_id = parts[0].replace("dr:", "")
+        full_info = parts[1]
         
-        # 提取括號內的英文名 (通常在最後一個括號)
+        # 提取日文名
+        jap_name = full_info.split(';')[0].split(' (')[0].strip()
+        
+        # 提取英文成分名
         eng_name = ""
-        if "(" in full_name and ")" in full_name:
-            eng_name = full_name[full_name.rfind("(")+1 : full_name.rfind(")")]
+        if "(" in full_info and ")" in full_info:
+            eng_name = full_info[full_info.rfind("(")+1 : full_info.rfind(")")]
         
-        # 提取日文名 (拿第一個分號前的內容)
-        jap_name = full_name.split(';')[0].split(' (')[0].strip()
-        
-        kegg_list.append({
-            'KEGG_ID': kegg_id,
-            '品項名稱': jap_name,
-            '成分名_英_NEW': eng_name
-        })
+        kegg_data.append({'品項名稱': jap_name, 'KEGG_ID_REF': k_id, 'ENG_REF': eng_name})
 
-    kegg_ref_df = pd.DataFrame(kegg_list)
+    # 轉成 DataFrame 並移除重複的日文名，確保對應唯一
+    ref_df = pd.DataFrame(kegg_data).drop_duplicates('品項名稱')
 
-    # 3. 與原本的資料進行合併 (左合併)
-    # 假設 input_df 有一欄叫 '品項名稱'
-    result_df = pd.merge(input_df, kegg_ref_df, on='品項名稱', how='left')
+    # 3. 合併資料
+    # 使用 left join 將參考資料拉進來
+    merged = pd.merge(input_df, ref_df, on='品項名稱', how='left')
 
-    # 4. 補齊空缺值
-    result_df['KEGG_ID'] = result_df['KEGG_ID'].fillna(result_df['KEGG_ID_NEW'])
-    result_df['成分名 (英)'] = result_df['成分名 (英)'].fillna(result_df['成分名_英_NEW'])
+    # 4. 補齊空缺 (如果原本是 NaN，就填入查到的值)
+    # 我們這裡直接使用引用的欄位名稱確保不會 Key Error
+    if 'KEGG_ID' in merged.columns:
+        merged['KEGG_ID'] = merged['KEGG_ID'].fillna(merged['KEGG_ID_REF'])
+    else:
+        merged['KEGG_ID'] = merged['KEGG_ID_REF']
 
-    # 移除暫存欄位
-    result_df = result_df.drop(columns=['KEGG_ID_NEW', '成分名_英_NEW'])
-    
-    return result_df
+    if '成分名 (英)' in merged.columns:
+        merged['成分名 (英)'] = merged['成分名 (英)'].fillna(merged['ENG_REF'])
+    else:
+        merged['成分名 (英)'] = merged['ENG_REF']
 
-# --- 使用範例 ---
-data = {
-    '品項名稱': ['アスピリン', 'アセトアミノフェン', 'ロキソプロフェンナトリウム水和物'],
-    'KEGG_ID': [None, None, None],
-    '成分名 (英)': [None, None, None]
-}
-my_df = pd.DataFrame(data)
-
-final_df = fetch_and_fill_kegg_data(my_df)
-print(final_df)
+    # 5. 移除暫存參考欄位並返回
+    return merged.drop(columns=['KEGG_ID_REF', 'ENG_REF'])
