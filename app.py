@@ -1,86 +1,67 @@
-import streamlit as st
 import pandas as pd
 import requests
-import re
+import io
 
-# --- 1. 頁面配置 ---
-st.set_page_config(page_title="KEGG 全檔案對照補完", layout="wide")
-
-# --- 2. 獲取 KEGG 完整字典 (快取以提升速度) ---
-@st.cache_data(ttl=86400)
-def fetch_kegg_master_list():
-    url = "https://rest.kegg.jp/list/drug_ja/"
-    kegg_map = {}
-    try:
-        response = requests.get(url, timeout=30)
-        if response.status_code == 200:
-            lines = response.text.strip().split('\n')
-            for line in lines:
-                parts = line.split('\t')
-                if len(parts) >= 2:
-                    k_id = parts[0].strip() # 例如 dr:D00001
-                    full_name = parts[1]
-                    # 解析 "日文名; 英文名 [其他]"
-                    if ';' in full_name:
-                        jp_name, rest = full_name.split(';', 1)
-                        en_name = rest.split('[')[0].strip()
-                        
-                        # 處理比對用的 Key：移除括號內容與空格
-                        clean_key = re.sub(r'[\(\（].*?[\)\）]', '', jp_name).replace(' ', '').strip()
-                        kegg_map[clean_key] = {"id": k_id, "en": en_name}
-        return kegg_map
-    except Exception as e:
-        st.error(f"連線 KEGG 失敗: {e}")
-        return {}
-
-# --- 3. UI 邏輯 ---
-st.title("🧪 KEGG 全量資料對照補完 (763 筆完整處理)")
-st.info("本程式將移除所有數量限制，針對 CSV 內所有項目進行英文名與 ID 比對。")
-
-uploaded_file = st.file_uploader("上傳您整合後的 CSV (Final_Drug_List_Merged.csv)", type="csv")
-
-if uploaded_file:
-    df = pd.read_csv(uploaded_file)
-    total_rows = len(df)
+def fetch_and_fill_kegg_data(input_df):
+    """
+    input_df 必須包含 '品項名稱' 欄位
+    會補齊 'KEGG_ID' 與 '成分名_英' 欄位
+    """
+    # 1. 從 KEGG API 下載最新的日本醫藥品對照清單 (dr_ja)
+    print("正在從 KEGG 下載最新對照數據...")
+    url = "https://rest.kegg.jp/list/dr_ja"
+    response = requests.get(url)
     
-    if st.button(f"開始全量比對 (共 {total_rows} 筆資料)"):
-        with st.spinner("正在加載 KEGG 最新藥典..."):
-            kegg_master = fetch_kegg_master_list()
+    if response.status_code != 200:
+        print("無法連接至 KEGG API")
+        return input_df
+
+    # 2. 解析 KEGG 原始數據 (格式為: ID \t 名稱1; 名稱2; (成分名英))
+    kegg_list = []
+    for line in response.text.strip().split('\n'):
+        parts = line.split('\t')
+        if len(parts) < 2:
+            continue
         
-        if kegg_master:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            # 遍歷所有列，不設 head() 限制
-            for i in range(total_rows):
-                raw_jp = str(df.at[i, '成分名 (日)']).strip()
-                
-                # 預處理對照用的日文 Key
-                # 1. 移除 (JP18), (局) 等括號內容
-                # 2. 移除 "水和物" 以增加匹配成功率
-                match_key = re.sub(r'[\(\（].*?[\)\）]', '', raw_jp)
-                match_key = match_key.replace('水和物', '').replace(' ', '').strip()
-                
-                if match_key in kegg_master:
-                    df.at[i, 'KEGG_ID'] = kegg_master[match_key]['id']
-                    df.at[i, '成分名 (英)'] = kegg_master[match_key]['en']
-                
-                # 每 20 筆更新進度介面
-                if i % 20 == 0 or i == total_rows - 1:
-                    progress_bar.progress((i + 1) / total_rows)
-                    status_text.text(f"進度: {i+1} / {total_rows} | 正在處理: {match_key}")
+        kegg_id = parts[0].replace("dr:", "")
+        full_name = parts[1]
+        
+        # 提取括號內的英文名 (通常在最後一個括號)
+        eng_name = ""
+        if "(" in full_name and ")" in full_name:
+            eng_name = full_name[full_name.rfind("(")+1 : full_name.rfind(")")]
+        
+        # 提取日文名 (拿第一個分號前的內容)
+        jap_name = full_name.split(';')[0].split(' (')[0].strip()
+        
+        kegg_list.append({
+            'KEGG_ID': kegg_id,
+            '品項名稱': jap_name,
+            '成分名_英_NEW': eng_name
+        })
 
-            st.success(f"✅ 全數 {total_rows} 筆資料比對完成！")
-            
-            # 顯示結果預覽 (這裡顯示 50 筆供確認，但下載的是全部)
-            st.subheader("比對結果預覽 (前 50 筆)")
-            st.dataframe(df[['成分名 (日)', '成分名 (英)', 'KEGG_ID', '翻譯理由']].head(50), use_container_width=True)
+    kegg_ref_df = pd.DataFrame(kegg_list)
 
-            # 生成下載連結
-            csv_final = df.to_csv(index=False, encoding="utf-8-sig")
-            st.download_button(
-                label="📥 下載最終完整對照補完檔案 (CSV)",
-                data=csv_final,
-                file_name="Final_Drug_List_All_763.csv",
-                mime="text/csv"
-            )
+    # 3. 與原本的資料進行合併 (左合併)
+    # 假設 input_df 有一欄叫 '品項名稱'
+    result_df = pd.merge(input_df, kegg_ref_df, on='品項名稱', how='left')
+
+    # 4. 補齊空缺值
+    result_df['KEGG_ID'] = result_df['KEGG_ID'].fillna(result_df['KEGG_ID_NEW'])
+    result_df['成分名 (英)'] = result_df['成分名 (英)'].fillna(result_df['成分名_英_NEW'])
+
+    # 移除暫存欄位
+    result_df = result_df.drop(columns=['KEGG_ID_NEW', '成分名_英_NEW'])
+    
+    return result_df
+
+# --- 使用範例 ---
+data = {
+    '品項名稱': ['アスピリン', 'アセトアミノフェン', 'ロキソプロフェンナトリウム水和物'],
+    'KEGG_ID': [None, None, None],
+    '成分名 (英)': [None, None, None]
+}
+my_df = pd.DataFrame(data)
+
+final_df = fetch_and_fill_kegg_data(my_df)
+print(final_df)
