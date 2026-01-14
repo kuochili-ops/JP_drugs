@@ -6,37 +6,40 @@ import re
 import urllib.parse
 
 # --- 1. 基礎工具函數 ---
-def clean_for_match(text):
+def normalize_for_match(text):
+    """僅供比對使用的清洗邏輯：轉半形、移除備註與藥典標記"""
     if not isinstance(text, str): return ""
+    # 轉半形
     text = text.translate(str.maketrans(
         '０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ（）',
         '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ()'
     ))
+    # 比對時忽略藥典標記 (JP/USP/NF)
     text = re.sub(r'\(JP\d+.*?\)', '', text)
     text = re.sub(r'\(USP.*?\)', '', text)
     text = re.sub(r'\(NF.*?\)', '', text)
+    # 忽略 ※ 或 * 備註符號
     text = re.sub(r'[※\*]\d+', '', text)
-    text = text.replace('－', '-').replace(' ', '').replace('　', '')
+    # 處理 L/D 前綴符號與空白
+    text = text.replace('－', '-').replace(' ', '').replace('　', '').replace('\n', '')
     return text.strip()
 
-# --- 2. 外部翻譯資源函數 ---
-
-# A. Wikipedia 翻譯 (利用 Wiki 的語言鏈接)
+# --- 2. 外部翻譯資源 ---
 def translate_via_wiki(jap_name):
+    """透過 Wikipedia 語言鏈結獲取學名"""
     try:
-        # 先找日文 Wiki 頁面
         search_url = f"https://ja.wikipedia.org/w/api.php?action=query&prop=langlinks&lllang=en&titles={urllib.parse.quote(jap_name)}&format=json"
         res = requests.get(search_url, timeout=5).json()
         pages = res.get('query', {}).get('pages', {})
         for k, v in pages.items():
             if 'langlinks' in v:
-                return v['langlinks'][0]['*'] # 返回英文頁面標題
+                return v['langlinks'][0]['*']
     except:
         pass
     return None
 
-# B. Azure Translator 翻譯
 def translate_via_azure(text, api_key, region):
+    """透過 Azure Translator 翻譯"""
     if not api_key or not region: return None
     endpoint = "https://api.cognitive.microsofttranslator.com/translate"
     params = {'api-version': '3.0', 'from': 'ja', 'to': 'en'}
@@ -52,15 +55,20 @@ def translate_via_azure(text, api_key, region):
     except:
         return None
 
-# --- 3. 核心處理邏輯 ---
-def fetch_and_fill_all_sources(input_df, azure_key, azure_region):
-    target_col = '成分名 (日)'
-    eng_col = '成分名 (英)'
-    id_col = 'KEGG_ID'
+# --- 3. 核心處理函數 ---
+def fetch_and_process_data(input_df, azure_key, azure_region):
+    TARGET_COL = '成分名 (日)'
+    ENG_COL = '成分名 (英)'
+    ID_COL = 'KEGG_ID'
 
-    # 取得 KEGG 對照表
-    url = "https://rest.kegg.jp/list/dr_ja"
-    kegg_res = requests.get(url, timeout=20)
+    # 下載 KEGG 資料庫
+    try:
+        kegg_res = requests.get("https://rest.kegg.jp/list/dr_ja", timeout=20)
+        kegg_res.raise_for_status()
+    except:
+        st.error("無法連線至 KEGG 資料庫")
+        return None
+
     kegg_ref = []
     for line in kegg_res.text.strip().split('\n'):
         parts = line.split('\t')
@@ -70,71 +78,91 @@ def fetch_and_fill_all_sources(input_df, azure_key, azure_region):
         eng_match = re.search(r'\(([^)]+)\)$', full_info)
         kegg_ref.append({
             'id': d_id,
-            'cleaned_name': clean_for_match(full_info),
+            'match_name': normalize_for_match(full_info),
             'eng': eng_match.group(1) if eng_match else ""
         })
 
-    # 執行逐行補齊
+    # 逐行執行補齊
     progress_bar = st.progress(0)
     total = len(input_df)
 
     for i, row in input_df.iterrows():
-        jap_name = str(row[target_col])
-        clean_name = clean_for_match(jap_name)
+        jap_raw = str(row[TARGET_COL])
+        jap_clean = normalize_for_match(jap_raw)
         
-        # 第一步：嘗試 KEGG (ID + 英文名)
-        if pd.isna(row.get(id_col)) or str(row.get(id_col)).strip() in ["", "nan"]:
-            found_id, found_eng = None, None
-            # 模糊比對邏輯... (簡化版)
+        # A. 第一優先：KEGG 補齊
+        if pd.isna(row.get(ID_COL)) or str(row.get(ID_COL)).strip() in ["", "nan"]:
             for ref in kegg_ref:
-                if clean_name in ref['cleaned_name']:
-                    found_id, found_eng = ref['id'], ref['eng']
+                # 模糊比對：包含或拆解比對
+                if jap_clean in ref['match_name'] or \
+                   ('・' in jap_clean and all(p in ref['match_name'] for p in jap_clean.split('・'))):
+                    input_df.at[i, ID_COL] = ref['id']
+                    if pd.isna(row.get(ENG_COL)) or str(row.get(ENG_COL)).strip() == "":
+                        input_df.at[i, ENG_COL] = ref['eng']
                     break
-            
-            if found_id:
-                input_df.at[i, id_col] = found_id
-                if pd.isna(row.get(eng_col)) or str(row.get(eng_col)).strip() == "":
-                    input_df.at[i, eng_col] = found_eng
 
-        # 第二步：如果英文名仍為空，嘗試 Wikipedia
-        if pd.isna(input_df.at[i, eng_col]) or str(input_df.at[i, eng_col]).strip() == "":
-            wiki_eng = translate_via_wiki(clean_name)
-            if wiki_eng:
-                input_df.at[i, eng_col] = f"{wiki_eng} (Wiki)"
+        # B. 第二優先：Wikipedia 翻譯 (若英文名仍為空)
+        current_eng = str(input_df.at[i, ENG_COL])
+        if pd.isna(input_df.at[i, ENG_COL]) or current_eng.strip() in ["", "nan"]:
+            wiki_res = translate_via_wiki(jap_clean)
+            if wiki_res:
+                input_df.at[i, ENG_COL] = f"{wiki_res} (Wiki)"
 
-        # 第三步：如果英文名仍為空，嘗試 Azure Translator
-        if pd.isna(input_df.at[i, eng_col]) or str(input_df.at[i, eng_col]).strip() == "":
-            azure_eng = translate_via_azure(jap_name, azure_key, azure_region)
-            if azure_eng:
-                input_df.at[i, eng_col] = f"{azure_eng} (Azure)"
+        # C. 第三優先：Azure 翻譯 (若英文名仍為空)
+        current_eng = str(input_df.at[i, ENG_COL])
+        if pd.isna(input_df.at[i, ENG_COL]) or current_eng.strip() in ["", "nan"]:
+            azure_res = translate_via_azure(jap_raw, azure_key, azure_region)
+            if azure_res:
+                input_df.at[i, ENG_COL] = f"{azure_res} (Azure)"
 
         progress_bar.progress((i + 1) / total)
     
     return input_df
 
 # --- 4. Streamlit UI ---
-st.title("💊 藥品全方位翻譯與補齊系統")
+st.set_page_config(page_title="藥品資料自動補齊系統", layout="wide")
+st.title("💊 藥品資料智慧補齊系統 (整合版)")
 
 with st.sidebar:
-    st.header("API 設定")
-    azure_key = st.text_input("Azure API Key", type="password")
-    azure_region = st.text_input("Azure Region (如 eastasia)")
+    st.header("🔑 翻譯 API 設定")
+    az_key = st.text_input("Azure API Key", type="password")
+    az_region = st.text_input("Azure Region (如 eastasia)")
+    st.info("如無 Azure 金鑰，系統將僅使用 KEGG 與 Wikipedia 資源。")
 
-uploaded_file = st.file_uploader("上傳 CSV 檔案", type=['csv'])
+uploaded_file = st.file_uploader("上傳 CSV 檔案 (欄位需包含 '成分名 (日)')", type=['csv'])
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
-    if st.button("執行多層級補齊"):
-        result_df = fetch_and_fill_all_sources(df.copy(), azure_key, azure_region)
-        st.success("補齊完成！")
-        
-        # 統計來源
-        azure_count = result_df[eng_col].str.contains("(Azure)", na=False).sum()
-        wiki_count = result_df[eng_col].str.contains("(Wiki)", na=False).sum()
-        kegg_count = result_df[id_col].notna().sum()
-        
-        st.write(f"📊 統計：KEGG 補齊 {kegg_count} 項 | Wiki 翻譯 {wiki_count} 項 | Azure 翻譯 {azure_count} 項")
-        st.dataframe(result_df)
-        
-        csv = result_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下載結果", data=csv, file_name="MultiSource_Drug_List.csv")
+    st.write("### 原始資料預覽")
+    st.dataframe(df.head(5))
+
+    if st.button("啟動多層級補齊程序"):
+        with st.spinner("正在執行跨資料庫檢索與翻譯..."):
+            result_df = fetch_and_process_data(df.copy(), az_key, az_region)
+            
+            if result_df is not None:
+                st.success("程序執行完畢！")
+                
+                # 統計數據 (修正 NameError 問題，直接使用字串)
+                k_filled = result_df['KEGG_ID'].notna().sum()
+                w_filled = result_df['成分名 (英)'].str.contains(r'\(Wiki\)', na=False).sum()
+                a_filled = result_df['成分名 (英)'].str.contains(r'\(Azure\)', na=False).sum()
+                final_miss = result_df['成分名 (英)'].isna().sum()
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("KEGG 成功數", f"{k_filled}")
+                c2.metric("Wiki 翻譯數", f"{w_filled}")
+                c3.metric("Azure 翻譯數", f"{a_filled}")
+                c4.metric("剩餘空缺", f"{final_miss}")
+
+                if final_miss > 0:
+                    with st.expander("🔍 檢視無法自動補齊的項目"):
+                        st.table(result_df[result_df['成分名 (英)'].isna()][['成分名 (日)']])
+
+                st.subheader("處理結果")
+                st.dataframe(result_df)
+
+                # 下載
+                output = io.BytesIO()
+                result_df.to_csv(output, index=False, encoding='utf-8-sig')
+                st.download_button("📥 下載修正後的 CSV", data=output.getvalue(), file_name="Drug_List_Full_Updated.csv")
