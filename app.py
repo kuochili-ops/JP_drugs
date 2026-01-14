@@ -4,30 +4,56 @@ import requests
 import io
 import re
 
-# 1. 基礎工具函數：處理全形轉半形
-def zen_to_han(text):
+# 1. 基礎工具函數：處理全形轉半形，並統一標點符號
+def normalize_text(text):
     if not isinstance(text, str): return str(text)
-    return text.translate(str.maketrans(
+    # 轉換全形數字、英文字母與括號
+    text = text.translate(str.maketrans(
         '０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ（）',
         '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ()'
-    )).strip()
+    ))
+    # 統一將常見的分隔符號轉為標準中間點 '・'
+    text = text.replace(' ', '').replace('　', '').replace('/', '・').replace(',', '・')
+    return text.strip()
 
-# 2. 核心補齊函數
-def fetch_and_fill_kegg_data_smart(input_df):
+# 2. 核心比對邏輯
+def smart_match(search_name, kegg_ref):
+    """
+    search_name: 使用者上傳的成分名
+    kegg_ref: KEGG 資料庫的參考清單
+    """
+    normalized_search = normalize_text(search_name)
+    
+    # 策略 A: 完全或包含比對 (例如 "A" 包含在 "A (JAN)")
+    for ref in kegg_ref:
+        if normalized_search in ref['clean_full']:
+            return ref['id'], ref['eng']
+
+    # 策略 B: 複方拆解比對 (處理 "A・B" 這種情況)
+    if '・' in normalized_search:
+        parts = [p for p in normalized_search.split('・') if p] # 拆分成分
+        for ref in kegg_ref:
+            # 必須所有拆分的成分都出現在 KEGG 的名稱中 (不限順序)
+            if all(part in ref['clean_full'] for part in parts):
+                return ref['id'], ref['eng']
+    
+    return None, None
+
+def fetch_and_fill_kegg_data_advanced(input_df):
     target_col = '成分名 (日)'
     eng_col = '成分名 (英)'
     id_col = 'KEGG_ID'
 
-    # 從 KEGG 抓取最新對照表
+    # 下載 KEGG 對照表
     url = "https://rest.kegg.jp/list/dr_ja"
     try:
-        response = requests.get(url, timeout=15)
+        response = requests.get(url, timeout=20)
         response.raise_for_status()
     except:
-        st.error("無法連線至 KEGG 資料庫，請檢查網路。")
+        st.error("無法連線至 KEGG 資料庫，請稍後再試。")
         return None
 
-    # 預處理 KEGG 資料
+    # 預處理 KEGG 資料以加快速度
     kegg_ref = []
     for line in response.text.strip().split('\n'):
         parts = line.split('\t')
@@ -35,76 +61,76 @@ def fetch_and_fill_kegg_data_smart(input_df):
         d_id = parts[0].replace("dr:", "")
         full_info = parts[1]
         
-        # 提取括號內的英文名 (JAN/USP等)
+        # 提取括號內的英文名 (JAN/USP)
         eng_match = re.search(r'\(([^)]+)\)$', full_info)
         eng_name = eng_match.group(1) if eng_match else ""
         
         kegg_ref.append({
             'id': "dr_ja:" + d_id,
-            'clean_full': zen_to_han(full_info),
+            'clean_full': normalize_text(full_info),
             'eng': eng_name
         })
 
-    # 執行補齊邏輯
+    # 執行補齊
     progress_bar = st.progress(0)
     total_rows = len(input_df)
     
     for i, row in input_df.iterrows():
-        # 若已存在 ID 則跳過
-        if pd.notna(row.get(id_col)) and str(row.get(id_col)).strip() != "":
-            progress_bar.progress((i + 1) / total_rows)
-            continue
-            
-        search_name = zen_to_han(str(row[target_col]))
-        
-        # 模糊比對：搜尋 KEGG 名稱是否包含藥品名
-        for ref in kegg_ref:
-            if search_name in ref['clean_full']:
-                input_df.at[i, id_col] = ref['id']
+        # 只有當 KEGG_ID 為空時才填補
+        current_id = str(row.get(id_col, ""))
+        if pd.isna(row.get(id_col)) or current_id.strip() == "" or current_id == "nan":
+            found_id, found_eng = smart_match(row[target_col], kegg_ref)
+            if found_id:
+                input_df.at[i, id_col] = found_id
+                # 只有當英文名也為空時才補
                 if pd.isna(row.get(eng_col)) or str(row.get(eng_col)).strip() == "":
-                    input_df.at[i, eng_col] = ref['eng']
-                break
+                    input_df.at[i, eng_col] = found_eng
         
         progress_bar.progress((i + 1) / total_rows)
     
     return input_df
 
-# --- 3. Streamlit 使用者介面 ---
-st.set_page_config(page_title="KEGG 藥品資料補齊器", layout="wide")
-st.title("💊 智慧型藥品資料補齊工具")
-st.markdown("針對 `成分名 (日)` 欄位進行模糊比對，自動補全 `KEGG_ID` 與 `英文成分名`。")
+# --- 3. Streamlit UI ---
+st.set_page_config(page_title="藥品資料智慧補齊器", layout="wide")
+st.title("💊 智慧型藥品資料補齊工具 (複方加強版)")
+st.markdown("""
+本工具會自動補齊 `KEGG_ID` 與 `成分名 (英)`：
+- **模糊比對**：自動處理全形數字 (４) 與半形 (4) 的差異。
+- **複方支援**：自動拆解 `・` 隔開的成分並進行交叉檢索。
+""")
 
-uploaded_file = st.file_uploader("請上傳您的 CSV 檔案", type=['csv'])
+uploaded_file = st.file_uploader("上傳 CSV 檔案 (需包含 '成分名 (日)' 欄位)", type=['csv'])
 
 if uploaded_file:
+    # 讀取資料
     df = pd.read_csv(uploaded_file)
     
     st.write("### 原始資料預覽")
     st.dataframe(df.head(5))
 
     if st.button("啟動智慧補齊"):
-        # 統計處理前的狀態
+        # 紀錄原始狀態
         initial_missing = df['KEGG_ID'].isna().sum()
         
-        with st.spinner("正在檢索 KEGG 資料庫並進行模糊比對..."):
-            result_df = fetch_and_fill_kegg_data_smart(df.copy())
+        with st.spinner("正在檢索 KEGG 並分析複方成分..."):
+            result_df = fetch_and_fill_kegg_data_advanced(df.copy())
             
             if result_df is not None:
+                # 計算結果
                 final_missing = result_df['KEGG_ID'].isna().sum()
                 filled_count = initial_missing - final_missing
                 
-                st.success("處理完成！")
+                st.success("補齊程序執行完畢！")
                 
-                # --- 統計儀表板 ---
+                # --- 統計面板 ---
+                col1, col2, col3 = st.columns(3)
+                col1.metric("成功補齊數量", f"{filled_count} 項")
+                col2.metric("尚未配對數量", f"{final_missing} 項", delta=f"-{filled_count}", delta_color="normal")
+                col3.metric("資料總筆數", f"{len(result_df)} 筆")
                 
-                m1, m2, m3 = st.columns(3)
-                m1.metric("成功補齊項數", f"{filled_count} 項")
-                m2.metric("尚未配對項數", f"{final_missing} 項", delta=f"-{filled_count}", delta_color="normal")
-                m3.metric("資料總筆數", f"{len(result_df)} 筆")
-                
-                # 顯示未配對清單
+                # --- 顯示未配對清單 ---
                 if final_missing > 0:
-                    with st.expander("查看無法配對的項目清單"):
+                    with st.expander("🔍 查看無法配對的項目 (建議手動檢查)"):
                         unmatched = result_df[result_df['KEGG_ID'].isna()][['成分名 (日)', '成分名 (英)']]
                         st.table(unmatched)
                 
@@ -115,7 +141,7 @@ if uploaded_file:
                 csv_buffer = io.BytesIO()
                 result_df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
                 st.download_button(
-                    label="📥 下載修正後的 CSV",
+                    label="📥 下載更新後的 CSV",
                     data=csv_buffer.getvalue(),
                     file_name="KEGG_Updated_List.csv",
                     mime="text/csv"
